@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "D:\\Dev\\Software\\Python\\Miniconda\\py310_255_11\\envs\\autox\\python.exe",
+    "python.terminal.activateEnvironment": true,
+    "terminal.integrated.env.windows": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+    }
+}

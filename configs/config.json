@@ -1,0 +1,20 @@
+{
+    "inference": {
+        "model_path": "yolov8n.pt",
+        "conf_thres": 0.8,
+        "iou_thres": 0.45,
+        "device": "cuda",
+        "target_classes": [
+            0
+        ]
+    },
+    "input": {
+        "sensitivity": 1.0,
+        "smooth": 5,
+        "fov": 50.0
+    },
+    "gui": {
+        "theme": "dark",
+        "show_debug": false
+    }
+}

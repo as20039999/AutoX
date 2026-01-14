@@ -1,0 +1,19 @@
+# 核心框架 (改为源码安装，便于深度定制)
+-e ./third_party/ultralytics
+PySide6==6.6.1
+
+# 深度学习后端 (对齐用户已知稳定版本)
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.1+cu128
+torchvision==0.24.1+cu128
+
+# 图像处理与采集
+numpy==1.26.4
+opencv-python==4.9.0.80
+pywin32==306
+mss==9.0.1
+dxcam
+
+# 安全防护预研
+pyarmor==8.4.6
+nuitka==2.0
