@@ -1,17 +1,30 @@
 {
     "inference": {
-        "model_path": "yolov8n.pt",
-        "conf_thres": 0.8,
+        "model_path": "D:/Dev/Projects/AS/Yolo_train/train2/weights/best.pt",
+        "conf_thres": 0.68,
         "iou_thres": 0.45,
         "device": "cuda",
         "target_classes": [
             0
-        ]
+        ],
+        "use_fov_inference": true,
+        "fov_center_mode": "screen"
     },
     "input": {
+        "fov": 800.0,
+        "auto_lock": true,
+        "auto_move": false,
+        "move_speed": "fast",
+        "custom_speed_ms": 1,
+        "custom_speed_random": 0,
+        "human_curve": false,
+        "offset_radius": 0,
+        "post_action": "",
         "sensitivity": 1.0,
         "smooth": 5,
-        "fov": 50.0
+        "trigger_mode": "manual",
+        "trigger_key": "Ctrl",
+        "toggle_key": "Ctrl+X"
     },
     "gui": {
         "theme": "dark",

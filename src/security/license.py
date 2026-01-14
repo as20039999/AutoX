@@ -4,6 +4,8 @@ import os
 from datetime import datetime, timedelta
 from .hardware import HardwareID
 
+from utils.paths import get_abs_path
+
 class LicenseManager:
     """
     授权管理类 (基础版本)
@@ -11,7 +13,10 @@ class LicenseManager:
     """
     
     SECRET_SALT = "AutoX_Secure_Salt_2026" # 混淆盐值
-    LICENSE_FILE = "license.dat"
+    
+    @property
+    def LICENSE_FILE(self):
+        return get_abs_path("license.dat")
 
     @classmethod
     def generate_key(cls, machine_id: str, days: int = 30) -> str:
@@ -31,12 +36,14 @@ class LicenseManager:
         """
         验证本地授权文件
         """
-        if not os.path.exists(cls.LICENSE_FILE):
+        # 使用类方法获取 LICENSE_FILE 路径，因为 LICENSE_FILE 变成了 property
+        license_path = get_abs_path("license.dat")
+        if not os.path.exists(license_path):
             print("[Security] 未找到授权文件")
             return False
             
         try:
-            with open(cls.LICENSE_FILE, "r") as f:
+            with open(license_path, "r") as f:
                 license_data = f.read().strip()
                 
             expiry_date_str, signature = license_data.split('.')
@@ -66,9 +73,10 @@ class LicenseManager:
     @classmethod
     def save_license(cls, key: str):
         """保存授权码到本地"""
-        with open(cls.LICENSE_FILE, "w") as f:
+        license_path = get_abs_path("license.dat")
+        with open(license_path, "w") as f:
             f.write(key)
-        print(f"[Security] 授权码已保存至 {cls.LICENSE_FILE}")
+        print(f"[Security] 授权码已保存至 {license_path}")
 
 if __name__ == "__main__":
     # 模拟流程

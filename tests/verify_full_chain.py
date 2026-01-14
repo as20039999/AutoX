@@ -22,7 +22,7 @@ def main():
     cap.start()
     
     # 3. 初始化推理引擎
-    model_path = "yolov8n.pt" 
+    model_path = "base.pt" 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     infer = YOLOInference(model_path=model_path, device=device, conf_thres=0.4)
 

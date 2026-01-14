@@ -67,7 +67,7 @@ QGroupBox::title {
 }
 
 QLabel {
-    color: #aaaaaa;
+    color: #ffffff;
 }
 
 QPushButton {
@@ -107,6 +107,7 @@ QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {
     border-radius: 4px;
     padding: 4px;
     color: #ffffff;
+    min-height: 32px;
 }
 
 QComboBox QAbstractItemView {

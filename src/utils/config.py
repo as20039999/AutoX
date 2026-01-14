@@ -1,21 +1,30 @@
 import json
 import os
 
+from .paths import get_abs_path
+
 class ConfigManager:
     """
     配置管理类，负责保存和读取用户设置
     """
     DEFAULT_CONFIG = {
         "inference": {
-            "model_path": "yolov8n.pt",
+            "model_path": "base.pt",
             "conf_thres": 0.4,
             "iou_thres": 0.45,
             "device": "cuda",
             "target_classes": [0]  # 0: person
         },
         "input": {
-            "sensitivity": 1.0,
-            "smooth": 5
+            "fov": 500,
+            "auto_lock": True,
+            "auto_move": True,
+            "move_speed": "normal", # fast, normal, slow, custom
+            "custom_speed_ms": 10,
+            "custom_speed_random": 5,
+            "human_curve": False,
+            "offset_radius": 0,
+            "post_action": "" # e.g., "LButton", "RButton", "Ctrl+A"
         },
         "gui": {
             "theme": "dark",
@@ -23,7 +32,9 @@ class ConfigManager:
         }
     }
     
-    CONFIG_PATH = "configs/config.json"
+    @property
+    def CONFIG_PATH(self):
+        return get_abs_path("configs/config.json")
 
     def __init__(self):
         self.config = self.DEFAULT_CONFIG.copy()

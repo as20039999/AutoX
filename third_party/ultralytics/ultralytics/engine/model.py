@@ -512,7 +512,7 @@ class Model(torch.nn.Module):
             - The method sets up a new predictor if not already present and updates its arguments with each call.
             - For SAM-type models, 'prompts' can be passed as a keyword argument.
         """
-        print("在此处修改Predict")
+        # print("在此处修改Predict")
         if source is None:
             source = "https://ultralytics.com/images/boats.jpg" if self.task == "obb" else ASSETS
             LOGGER.warning(f"'source' is missing. Using 'source={source}'.")

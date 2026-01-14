@@ -35,7 +35,7 @@ class Win32Input(AbstractInput):
     def move_to(self, x: int, y: int):
         self._send_mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, x, y)
 
-    def smooth_move_to(self, x: int, y: int, duration: float = 0.1):
+    def smooth_move_to(self, x: int, y: int, duration: float = 0.1, human_curve: bool = False):
         """
         平滑移动到绝对坐标 (基于当前位置计算相对增量)
         """
@@ -49,17 +49,18 @@ class Win32Input(AbstractInput):
         dx = x - pt.x
         dy = y - pt.y
         
-        self.smooth_move_rel(dx, dy, duration)
+        self.smooth_move_rel(dx, dy, duration, human_curve)
 
     def move_rel(self, dx: int, dy: int):
         self._send_mouse_event(MOUSEEVENTF_MOVE, dx, dy)
 
-    def smooth_move_rel(self, dx: int, dy: int, duration: float = 0.1):
+    def smooth_move_rel(self, dx: int, dy: int, duration: float = 0.1, human_curve: bool = False):
         """
         使用正弦加速/减速曲线实现平滑移动
         :param dx: 相对 X 偏移
         :param dy: 相对 Y 偏移
         :param duration: 移动总时长 (秒)
+        :param human_curve: 是否模拟人类随机曲线
         """
         if dx == 0 and dy == 0:
             return
@@ -70,15 +71,32 @@ class Win32Input(AbstractInput):
         current_dx = 0
         current_dy = 0
         
+        # 如果启用人类曲线，生成一个中途的随机偏移点
+        ctrl_x, ctrl_y = 0, 0
+        if human_curve:
+            # 在垂直于移动方向的轴上产生偏移
+            dist = math.sqrt(dx**2 + dy**2)
+            if dist > 10:
+                offset_scale = dist * 0.1  # 偏移量约为距离的 10%
+                # 垂直向量 (-dy, dx)
+                v_x, v_y = -dy / dist, dx / dist
+                rand_offset = random.uniform(-offset_scale, offset_scale)
+                ctrl_x, ctrl_y = v_x * rand_offset, v_y * rand_offset
+
         for i in range(1, steps + 1):
-            # 使用正弦函数实现 S 型曲线 (0 到 1)
-            # t = i / steps
-            # multiplier = (1 - math.cos(t * math.pi)) / 2
-            
-            # 更简单的线性插值配合一点点随机抖动
             t = i / steps
-            target_dx = int(dx * t)
-            target_dy = int(dy * t)
+            
+            if human_curve:
+                # 使用二次贝塞尔曲线公式: (1-t)^2*P0 + 2(1-t)t*P1 + t^2*P2
+                # 这里 P0=(0,0), P2=(dx, dy), P1=(dx/2 + ctrl_x, dy/2 + ctrl_y)
+                # target_x(t) = 2(1-t)t*(dx/2 + ctrl_x) + t^2*dx
+                target_dx = 2 * (1 - t) * t * (dx / 2 + ctrl_x) + t**2 * dx
+                target_dy = 2 * (1 - t) * t * (dy / 2 + ctrl_y) + t**2 * dy
+            else:
+                # 正弦 S 曲线
+                multiplier = (1 - math.cos(t * math.pi)) / 2
+                target_dx = dx * multiplier
+                target_dy = dy * multiplier
             
             # 计算这一步需要移动的增量
             step_dx = target_dx - current_dx
@@ -97,8 +115,8 @@ class Win32Input(AbstractInput):
             time.sleep(interval)
             
         # 确保最后补偿到精确位置
-        final_dx = dx - current_dx
-        final_dy = dy - current_dy
+        final_dx = dx - int(current_dx)
+        final_dy = dy - int(current_dy)
         if final_dx != 0 or final_dy != 0:
             self.move_rel(final_dx, final_dy)
 

@@ -34,7 +34,26 @@ class YOLOInference(AbstractInference):
         self.load_model()
 
     def load_model(self):
+        import os
+        from utils.paths import get_root_path, get_abs_path
+        
+        # 处理模型路径：如果是相对路径（只是个文件名），则拼接到项目根目录
+        if not os.path.isabs(self.model_path):
+            self.model_path = get_abs_path(self.model_path)
+            
         print(f"[Inference] 正在加载模型: {self.model_path}")
+        
+        # 检查模型文件是否存在
+        if not os.path.exists(self.model_path):
+            print(f"[Inference] 错误: 找不到模型文件 {self.model_path}")
+            # 尝试回退到 base.pt
+            fallback_path = get_abs_path("base.pt")
+            if os.path.exists(fallback_path) and self.model_path != fallback_path:
+                print(f"[Inference] 尝试回退到默认模型: {fallback_path}")
+                self.model_path = fallback_path
+            else:
+                raise FileNotFoundError(f"找不到模型文件: {self.model_path}")
+
         # 直接使用 YOLO 加载 .pt 文件
         self.model = YOLO(self.model_path)
         

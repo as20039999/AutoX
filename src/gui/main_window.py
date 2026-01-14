@@ -1,21 +1,342 @@
 import sys
 import os
 import shutil
+import ctypes
 import random
-from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+import time
+from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QPushButton, QLabel, QGroupBox, QDoubleSpinBox, 
                              QCheckBox, QFrame, QSpacerItem, QSizePolicy,
                              QTabWidget, QFileDialog, QProgressBar, QComboBox,
                              QLineEdit, QMessageBox, QSpinBox, QListWidget, QInputDialog, QDialog,
                              QAbstractSpinBox, QTextEdit, QPlainTextEdit, QSplitter, QMenu)
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
-from PySide6.QtGui import QIcon, QAction, QKeySequence, QShortcut, QPixmap, QPainter, QColor
+from PySide6.QtGui import QIcon, QAction, QKeySequence, QShortcut, QPixmap, QPainter, QColor, QImage
+
+class PreviewWindow(QDialog):
+    """
+    高性能实时预览窗口，使用 PySide6 实现以替代 cv2.imshow。
+    支持置顶、不获取焦点、抗锯齿显示。
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AutoX 实时预览")
+        self.setWindowFlags(
+            Qt.Window | 
+            Qt.WindowStaysOnTopHint | 
+            Qt.WindowDoesNotAcceptFocus |
+            Qt.WindowMinMaxButtonsHint
+        )
+        # 默认不获取焦点，防止游戏掉帧或输入冲突
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.label = QLabel("等待图像...")
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setStyleSheet("background-color: black; color: white;")
+        layout.addWidget(self.label)
+        
+        self.resize(640, 480)
+
+    def update_frame(self, frame):
+        """更新显示帧 (BGR 格式)"""
+        if frame is None:
+            return
+            
+        try:
+            height, width, channel = frame.shape
+            bytes_per_line = 3 * width
+            
+            # 使用 BGR888 格式
+            q_img = QImage(frame.data, width, height, bytes_per_line, QImage.Format_BGR888)
+            pixmap = QPixmap.fromImage(q_img)
+            
+            # 等比例缩放以适应窗口
+            scaled_pixmap = pixmap.scaled(self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.label.setPixmap(scaled_pixmap)
+        except Exception as e:
+            print(f"Preview update error: {e}")
 
 from .styles import MAIN_STYLE
 from .labeling_canvas import LabelingCanvas
+from .overlay_window import OverlayWindow
 from utils.config import ConfigManager
 from utils.video_processor import VideoProcessor
 from utils.yolo_helper import YOLOHelper
+
+from utils.paths import get_abs_path, get_root_path
+from utils.hotkey import get_pressed_hotkey_str, is_hotkey_pressed
+
+class HotkeyRecorder(QWidget):
+    """
+    自定义热键录制组件
+    显示当前热键，并提供按钮进行重新录制
+    """
+    key_changed = Signal(str)
+
+    def __init__(self, current_key="Shift", parent=None):
+        super().__init__(parent)
+        self.current_key = current_key
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.key_display = QLineEdit(self.current_key)
+        self.key_display.setReadOnly(True)
+        self.key_display.setPlaceholderText("未设置")
+        layout.addWidget(self.key_display)
+        
+        self.record_btn = QPushButton("配置")
+        self.record_btn.setFixedWidth(60)
+        self.record_btn.clicked.connect(self._start_recording)
+        layout.addWidget(self.record_btn)
+        
+        self.clear_btn = QPushButton("清除")
+        self.clear_btn.setFixedWidth(60)
+        self.clear_btn.clicked.connect(self._clear_hotkey)
+        layout.addWidget(self.clear_btn)
+        
+        self.recording = False
+        self.recorded_hotkey = None
+        self.is_waiting_release = False
+        self.last_press_time = 0
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._check_keys)
+
+    def set_key(self, key):
+        self.current_key = key
+        self.key_display.setText(key)
+
+    def get_key(self):
+        return self.current_key
+
+    def _clear_hotkey(self):
+        """清除当前热键"""
+        if self.recording:
+            return
+        self.current_key = ""
+        self.key_display.setText("")
+        self.key_changed.emit("")
+
+    def _start_recording(self):
+        if self.recording:
+            return
+            
+        self.recording = True
+        self.recorded_hotkey = None
+        self.is_waiting_release = False
+        self.last_press_time = 0
+        
+        self.record_btn.setText("按键...")
+        self.record_btn.setStyleSheet("background-color: #ff9900; color: white;")
+        self.key_display.setText("请按下按键 (支持组合键)...")
+        self.timer.start(30) # 30ms 轮询一次，提高精度
+
+    def _check_keys(self):
+        if not self.recording:
+            return
+            
+        current_hotkey = get_pressed_hotkey_str()
+        
+        if current_hotkey:
+            # 只要有按键按下，就更新记录的最长组合键
+            # 比较逻辑：按键数量多优先，按键数量一样时保持现状
+            if not self.recorded_hotkey:
+                self.recorded_hotkey = current_hotkey
+            else:
+                current_keys = current_hotkey.split('+')
+                recorded_keys = self.recorded_hotkey.split('+')
+                if len(current_keys) >= len(recorded_keys):
+                    self.recorded_hotkey = current_hotkey
+            
+            self.last_press_time = time.time()
+            self.is_waiting_release = True
+            self.key_display.setText(self.recorded_hotkey)
+        elif self.is_waiting_release:
+            # 如果进入了等待释放状态，且当前没有按键按下
+            # 检查是否已经释放了一段时间（例如 300ms），或者距离第一次按键已经很久了
+            if time.time() - self.last_press_time > 0.3:
+                # 结束录制
+                self.recording = False
+                self.timer.stop()
+                
+                if self.recorded_hotkey:
+                    self.current_key = self.recorded_hotkey
+                    self.key_changed.emit(self.current_key)
+                
+                self.record_btn.setText("配置")
+                self.record_btn.setStyleSheet("")
+                self.key_display.setText(self.current_key)
+                self.is_waiting_release = False
+
+class TrainingThread(QThread):
+    progress = Signal(str)
+    epoch_progress = Signal(int, int) # current, total
+    finished = Signal(bool, str)
+
+    def __init__(self, model_path, data_yaml, epochs, workers, project_dir, batch=16, cache=False, imgsz=640):
+        super().__init__()
+        self.model_path = model_path
+        self.data_yaml = data_yaml
+        self.epochs = epochs
+        self.workers = workers
+        self.project_dir = project_dir
+        self.batch = batch
+        self.cache = cache
+        self.imgsz = imgsz
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+
+    def run(self):
+        try:
+            from ultralytics import YOLO, settings
+            from ultralytics.utils import USER_CONFIG_DIR
+            import logging
+            import re
+            import shutil
+            
+            # 预先处理字体问题，避免训练时自动下载
+            try:
+                font_name = "Arial.Unicode.ttf"
+                target_font_path = USER_CONFIG_DIR / font_name
+                if not target_font_path.exists():
+                    # 尝试从项目 assets 目录加载
+                    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                    local_font_path = os.path.join(project_root, "assets", font_name)
+                    if os.path.exists(local_font_path):
+                        self.progress.emit(f"检测到本地字体，正在安装到配置目录: {target_font_path}")
+                        os.makedirs(USER_CONFIG_DIR, exist_ok=True)
+                        shutil.copy2(local_font_path, target_font_path)
+            except Exception as e:
+                print(f"Font localization failed: {e}")
+
+            # ANSI 转义序列正则，用于过滤颜色代码
+            ansi_escape = re.compile(r'\x1b\[[0-9;]*[mGKFHD]')
+            # 提取 Epoch 进度的正则，例如 "1/200"
+            epoch_pattern = re.compile(r'(\d+)/(\d+)')
+            
+            # 自定义日志处理器，用于捕获训练输出
+            class LogHandler(logging.Handler):
+                def __init__(self, thread):
+                    super().__init__()
+                    self.thread = thread
+                def emit(self, record):
+                    try:
+                        msg = self.format(record)
+                        # 过滤 ANSI 颜色代码
+                        clean_msg = ansi_escape.sub('', msg).replace('\r', '\n')
+                        if not clean_msg.strip():
+                            return
+                        
+                        # 确保每条日志都有换行，但避免重复换行
+                        self.thread.progress.emit(clean_msg.rstrip() + "\n")
+                    except Exception:
+                        pass
+
+            # 获取 ultralytics 的日志记录器并添加我们的处理器
+            ultralytics_logger = logging.getLogger("ultralytics")
+            handler = LogHandler(self)
+            handler.setFormatter(logging.Formatter('%(message)s'))
+            ultralytics_logger.addHandler(handler)
+            ultralytics_logger.setLevel(logging.INFO)
+            
+            # 定义回调函数
+            def on_train_batch_end(trainer):
+                try:
+                    # YOLOv8 中总 batch 数通常存储在 trainer.nb 中
+                    nb = getattr(trainer, 'nb', None)
+                    if nb is None and hasattr(trainer, 'train_loader'):
+                        nb = len(trainer.train_loader)
+                    
+                    if nb and nb > 0:
+                        batch_p = (trainer.batch + 1) / nb
+                        current_total_p = int((trainer.epoch + batch_p) * 100)
+                        self.epoch_progress.emit(current_total_p, self.epochs * 100)
+                except Exception:
+                    pass
+
+            def on_train_epoch_end(trainer):
+                try:
+                    curr_epoch = trainer.epoch + 1
+                    self.epoch_progress.emit(curr_epoch * 100, self.epochs * 100)
+                except Exception:
+                    pass
+
+            # 同时也尝试直接给 ultralytics 的内部 LOGGER 添加处理器
+            try:
+                from ultralytics.utils import LOGGER as ut_logger
+                # 移除旧的 handler 防止重复
+                for h in ut_logger.handlers[:]:
+                    if isinstance(h, LogHandler):
+                        ut_logger.removeHandler(h)
+                ut_logger.addHandler(handler)
+            except:
+                pass
+
+            try:
+                # 确保 project_dir 是绝对路径且格式正确
+                abs_project_dir = os.path.abspath(self.project_dir).replace("\\", "/")
+                
+                # 彻底禁用全局 settings 中的 runs_dir 影响，将其设为用户选择的目录
+                try:
+                    settings.update({
+                        'datasets_dir': '',
+                        'runs_dir': abs_project_dir
+                    })
+                except Exception as e:
+                    print(f"Update settings failed: {e}")
+
+                model = YOLO(self.model_path)
+                
+                # 定义回调来检查停止标志
+                def on_train_batch_start(trainer):
+                    if not self.is_running:
+                        raise Exception("Training stopped by user")
+
+                model.add_callback("on_train_batch_start", on_train_batch_start)
+                model.add_callback("on_train_batch_end", on_train_batch_end)
+                model.add_callback("on_train_epoch_end", on_train_epoch_end)
+                
+                # 分离 project 和 name。
+                # YOLOv8 最终输出路径是 project/name。
+                # 如果我们要输出到 D:/Results，最好的办法是 project=D:/, name=Results
+                project_path = os.path.dirname(abs_project_dir).replace("\\", "/")
+                run_name = os.path.basename(abs_project_dir)
+                
+                # 如果 run_name 为空（说明选择了磁盘根目录），则必须指定名称
+                if not run_name:
+                    run_name = "train_output"
+                
+                model.train(
+                    data=self.data_yaml,
+                    epochs=self.epochs,
+                    imgsz=self.imgsz,
+                    workers=self.workers,
+                    batch=self.batch,
+                    cache=self.cache,
+                    project=project_path,
+                    name=run_name,
+                    exist_ok=True,
+                    verbose=True # 确保输出详细日志
+                )
+            finally:
+                # 无论成功失败，都移除处理器
+                ultralytics_logger.removeHandler(handler)
+                ultralytics_logger.propagate = True
+
+            if self.is_running:
+                self.finished.emit(True, "训练完成！")
+            else:
+                self.finished.emit(False, "训练已手动停止。")
+        except Exception as e:
+            if "Training stopped by user" in str(e):
+                self.finished.emit(False, "训练已手动停止。")
+            else:
+                self.finished.emit(False, f"训练发生错误: {str(e)}")
 
 class LabelSelectionDialog(QDialog):
     """自定义标签选择与输入对话框"""
@@ -88,23 +409,66 @@ class ExtractionThread(QThread):
         )
         self.finished.emit(success, message)
 
+class OptimizationThread(QThread):
+    progress = Signal(int)
+    finished = Signal(bool, str)
+
+    def __init__(self, source_dir, target_dir, imgsz):
+        super().__init__()
+        self.source_dir = source_dir
+        self.target_dir = target_dir
+        self.imgsz = imgsz
+
+    def run(self):
+        from utils.yolo_helper import YOLOHelper
+        try:
+            success = YOLOHelper.optimize_dataset(
+                self.source_dir, 
+                self.target_dir, 
+                imgsz=self.imgsz,
+                progress_callback=lambda p: self.progress.emit(p)
+            )
+            if success:
+                self.finished.emit(True, "数据集优化完成！\n请使用优化后的目录进行训练，并记得在训练时设置相同的 imgsz。")
+            else:
+                self.finished.emit(False, "优化未完成，可能未找到有效标注数据。")
+        except Exception as e:
+            self.finished.emit(False, f"优化过程中发生错误: {e}")
+
 class MainWindow(QMainWindow):
     def __init__(self, controller, config: ConfigManager):
         super().__init__()
         self.controller = controller
         self.config = config
+        self.preview_window = None
+        self.overlay_window = None
         
         self.setWindowTitle("AutoX - AI 控制中心")
-        self.setMinimumSize(400, 500)
+        
+        # 设置窗口大小：默认高度 880，若超过屏幕可用高度则自适应
+        screen_geo = self.screen().availableGeometry()
+        target_width = 800
+        target_height = min(880, screen_geo.height())
+        self.resize(target_width, target_height)
+        self.setMinimumWidth(target_width)
+        
         self.setStyleSheet(MAIN_STYLE)
         
         self._init_ui()
         self._load_config_to_ui()
         
+        # 排除在采集之外
+        self._exclude_from_capture(self)
+        
         # 状态更新定时器
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self._update_status)
         self.status_timer.start(500)
+
+        # 预览更新定时器 (10ms)
+        self.preview_timer = QTimer()
+        self.preview_timer.timeout.connect(self._process_preview)
+        self.preview_timer.start(10)
 
     def _init_ui(self):
         central_widget = QWidget()
@@ -131,6 +495,11 @@ class MainWindow(QMainWindow):
         self.label_tab = QWidget()
         self._init_label_tab()
         self.tabs.addTab(self.label_tab, "数据标注")
+
+        # 4. 模型管理选项卡
+        self.model_tab = QWidget()
+        self._init_model_tab()
+        self.tabs.addTab(self.model_tab, "模型管理")
         
         self.init_shortcuts()
 
@@ -181,77 +550,210 @@ class MainWindow(QMainWindow):
     def _init_control_tab(self):
         layout = QVBoxLayout(self.control_tab)
         layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(12)
+        layout.setSpacing(15)
 
-        # 标题栏
-        title_label = QLabel("AutoX System")
-        title_label.setStyleSheet("font-size: 22px; font-weight: bold; color: #ffffff;")
-        layout.addWidget(title_label)
-
-        # 状态卡片
-        self.status_frame = QFrame()
-        self.status_frame.setStyleSheet("background-color: #2d2d2d; border-radius: 8px; padding: 10px;")
-        status_layout = QHBoxLayout(self.status_frame)
+        # 1. 标题与状态
+        header_layout = QHBoxLayout()
+        title_label = QLabel("AutoX 控制中心")
+        title_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #ffffff;")
+        header_layout.addWidget(title_label)
+        header_layout.addStretch()
+        
+        # 状态指示器
         self.status_indicator = QLabel("●")
-        self.status_indicator.setStyleSheet("color: #d83b01; font-size: 18px;")
+        self.status_indicator.setStyleSheet("color: #d83b01; font-size: 14px; margin-right: 5px;")
         self.status_text = QLabel("系统未启动")
-        self.status_text.setStyleSheet("color: #ffffff; font-weight: bold;")
-        status_layout.addWidget(self.status_indicator)
-        status_layout.addWidget(self.status_text)
-        status_layout.addStretch()
-        layout.addWidget(self.status_frame)
+        self.status_text.setStyleSheet("color: #aaaaaa; font-weight: bold;")
+        header_layout.addWidget(self.status_indicator)
+        header_layout.addWidget(self.status_text)
+        layout.addLayout(header_layout)
 
-        # 推理设置
+        # 2. 推理配置
         infer_group = QGroupBox("推理配置")
         infer_layout = QVBoxLayout(infer_group)
-        
-        conf_layout = QHBoxLayout()
-        conf_layout.addWidget(QLabel("置信度阈值:"))
+        infer_layout.setSpacing(12)
+        infer_layout.setContentsMargins(12, 20, 12, 12)
+
+        def create_row(label_text, widget, tooltip=None):
+            row = QHBoxLayout()
+            display_text = label_text
+            if tooltip:
+                display_text += " (?)"
+            label = QLabel(display_text)
+            if tooltip:
+                label.setToolTip(tooltip)
+                widget.setToolTip(tooltip)
+            label.setFixedWidth(120)
+            row.addWidget(label)
+            
+            # 设置控件为自动扩展
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            row.addWidget(widget)
+            return row
+
+        # 置信度
         self.conf_spin = QDoubleSpinBox()
-        self.conf_spin.setRange(0.1, 0.9)
+        self.conf_spin.setRange(0.1, 0.95)
         self.conf_spin.setSingleStep(0.05)
         self.conf_spin.valueChanged.connect(self._on_config_changed)
-        conf_layout.addWidget(self.conf_spin)
-        infer_layout.addLayout(conf_layout)
-        
-        self.debug_check = QCheckBox("显示实时预览窗口")
+        infer_layout.addLayout(create_row("置信度阈值", self.conf_spin, "只有 AI 判定目标的概率高于此值时才会触发锁定。值越高识别越严苛，越低越容易误识别。"))
+
+        # 推理中心
+        self.fov_center_combo = QComboBox()
+        self.fov_center_combo.addItems(["屏幕中心", "鼠标位置"])
+        self.fov_center_combo.currentIndexChanged.connect(self._on_config_changed)
+        infer_layout.addLayout(create_row("推理中心", self.fov_center_combo, "选择推理区域和锁定范围的参考点。'屏幕中心'适合大多数第一人称射击游戏，'鼠标位置'适合 MOBA 或其他需要鼠标精准控制的游戏。"))
+
+        # 启动模式
+        self.trigger_mode_combo = QComboBox()
+        self.trigger_mode_combo.addItems(["点击启动按钮后生效", "长按热键生效"])
+        self.trigger_mode_combo.currentIndexChanged.connect(self._on_config_changed)
+        infer_layout.addLayout(create_row("启动模式", self.trigger_mode_combo, "选择 '长按热键生效' 后，系统仅在按下指定键时才会锁定目标，松开即停止。"))
+
+        # 触发键
+        self.trigger_key_recorder = HotkeyRecorder(current_key="Shift")
+        self.trigger_key_recorder.key_changed.connect(self._on_config_changed)
+        infer_layout.addLayout(create_row("触发热键", self.trigger_key_recorder, "仅在'长按热键生效'模式下有效。点击配置后，直接按下按键进行录制。"))
+
+        # 启停键
+        self.toggle_key_recorder = HotkeyRecorder(current_key="F9")
+        self.toggle_key_recorder.key_changed.connect(self._on_config_changed)
+        infer_layout.addLayout(create_row("全局启停键", self.toggle_key_recorder, "全局快捷键，用于在游戏内快速开启或停止系统运行。"))
+
+        # 功能开关
+        checks_layout = QHBoxLayout()
+        self.debug_check = QCheckBox("显示调试窗口 (?)")
+        self.debug_check.setToolTip("弹出一个独立的窗口显示当前的 AI 推理画面，包含识别框和锁定范围。")
         self.debug_check.stateChanged.connect(self._on_config_changed)
-        infer_layout.addWidget(self.debug_check)
+        
+        self.overlay_check = QCheckBox("启用屏幕绘制 (?)")
+        self.overlay_check.setToolTip("在屏幕顶层覆盖透明图层，直接绘制识别框，不影响鼠标操作。体验更佳。")
+        self.overlay_check.stateChanged.connect(self._on_config_changed)
+        
+        self.fov_inference_check = QCheckBox("高精度局部推理 (?)")
+        self.fov_inference_check.setToolTip("仅对准星或鼠标附近的区域进行推理。这能显著提升远距离小目标的识别率，并降低 CPU/GPU 负担。")
+        self.fov_inference_check.stateChanged.connect(self._on_config_changed)
+        
+        checks_layout.addWidget(self.debug_check)
+        checks_layout.addWidget(self.overlay_check)
+        checks_layout.addWidget(self.fov_inference_check)
+        infer_layout.addLayout(checks_layout)
+        
         layout.addWidget(infer_group)
 
-        # 行为设置
+        # 3. 行为控制
         input_group = QGroupBox("行为控制")
         input_layout = QVBoxLayout(input_group)
-        
-        smooth_layout = QHBoxLayout()
-        smooth_layout.addWidget(QLabel("瞄准平滑度:"))
-        self.smooth_spin = QDoubleSpinBox()
-        self.smooth_spin.setRange(1.0, 10.0)
-        self.smooth_spin.setSingleStep(0.5)
-        self.smooth_spin.valueChanged.connect(self._on_config_changed)
-        smooth_layout.addWidget(self.smooth_spin)
-        input_layout.addLayout(smooth_layout)
+        input_layout.setSpacing(12)
+        input_layout.setContentsMargins(12, 20, 12, 12)
 
-        fov_layout = QHBoxLayout()
-        fov_layout.addWidget(QLabel("锁定范围 (FOV):"))
+        # 行为开关行
+        behavior_checks = QHBoxLayout()
+        self.auto_lock_check = QCheckBox("自动锁定 (?)")
+        self.auto_lock_check.setToolTip("开启后，系统会自动选择离鼠标最近的目标。如果关闭，仅进行推理显示。")
+        self.auto_lock_check.stateChanged.connect(self._on_config_changed)
+        
+        self.auto_move_check = QCheckBox("自动移动 (?)")
+        self.auto_move_check.setToolTip("开启后，鼠标会自动移动到目标中心。")
+        self.auto_move_check.stateChanged.connect(self._on_config_changed)
+        
+        self.human_curve_check = QCheckBox("模拟人类曲线 (?)")
+        self.human_curve_check.setToolTip("开启后，鼠标将模拟人类随机曲线轨迹移动，更具欺骗性。")
+        self.human_curve_check.stateChanged.connect(self._on_config_changed)
+        
+        behavior_checks.addWidget(self.auto_lock_check)
+        behavior_checks.addWidget(self.auto_move_check)
+        behavior_checks.addWidget(self.human_curve_check)
+        input_layout.addLayout(behavior_checks)
+
+        # 范围与偏移行 (User Request: Move offset to same row as fov, split equally)
+        fov_offset_layout = QHBoxLayout()
+        
+        # 左侧：推理范围
+        fov_sub_layout = QHBoxLayout()
+        fov_label = QLabel("推理范围 (?)")
+        fov_label.setToolTip("AI 进行识别的区域大小。范围越大识别越多，但会增加计算负担。")
+        fov_label.setFixedWidth(80)
         self.fov_spin = QDoubleSpinBox()
-        self.fov_spin.setRange(50, 800)
-        self.fov_spin.setSingleStep(10)
+        self.fov_spin.setRange(50, 2000)
+        self.fov_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.fov_spin.setToolTip("AI 进行识别的区域大小。范围越大识别越多，但会增加计算负担。")
         self.fov_spin.valueChanged.connect(self._on_config_changed)
-        fov_layout.addWidget(self.fov_spin)
-        input_layout.addLayout(fov_layout)
+        fov_sub_layout.addWidget(fov_label)
+        fov_sub_layout.addWidget(self.fov_spin)
+        
+        # 右侧：目标偏移半径
+        offset_sub_layout = QHBoxLayout()
+        offset_label = QLabel("目标偏移半径 (?)")
+        offset_label.setToolTip("0表示锁定中心点。大于0则在中心点指定半径的圆内随机偏移。")
+        offset_label.setFixedWidth(110)
+        offset_label.setStyleSheet("margin-left: 10px;")
+        self.offset_spin = QSpinBox()
+        self.offset_spin.setRange(0, 100)
+        self.offset_spin.setSuffix(" px")
+        self.offset_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.offset_spin.setToolTip("0表示锁定中心点。大于0则在中心点指定半径的圆内随机偏移。")
+        self.offset_spin.valueChanged.connect(self._on_config_changed)
+        offset_sub_layout.addWidget(offset_label)
+        offset_sub_layout.addWidget(self.offset_spin)
+        
+        fov_offset_layout.addLayout(fov_sub_layout)
+        fov_offset_layout.addLayout(offset_sub_layout)
+        input_layout.addLayout(fov_offset_layout)
+
+        # 移动速度行
+        speed_layout = QHBoxLayout()
+        speed_label = QLabel("移动速度 (?)")
+        speed_label.setToolTip("设置鼠标移动到目标的速度。'极快'为瞬移，其他模式会平滑过渡。")
+        speed_label.setFixedWidth(80)
+        self.move_speed_combo = QComboBox()
+        self.move_speed_combo.addItems(["极快", "快速", "正常", "慢速", "自定义(ms)"])
+        self.move_speed_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.move_speed_combo.setToolTip("设置鼠标移动到目标的速度。'极快'为瞬移，其他模式会平滑过渡。")
+        self.move_speed_combo.currentIndexChanged.connect(self._on_config_changed)
+        
+        self.custom_speed_spin = QSpinBox()
+        self.custom_speed_spin.setRange(1, 500)
+        self.custom_speed_spin.setSuffix("ms")
+        self.custom_speed_spin.setFixedWidth(80)
+        self.custom_speed_spin.setVisible(False)
+        self.custom_speed_spin.valueChanged.connect(self._on_config_changed)
+        
+        self.custom_random_label = QLabel("±")
+        self.custom_random_label.setVisible(False)
+        
+        self.custom_random_spin = QSpinBox()
+        self.custom_random_spin.setRange(0, 100)
+        self.custom_random_spin.setSuffix("ms")
+        self.custom_random_spin.setFixedWidth(80)
+        self.custom_random_spin.setVisible(False)
+        self.custom_random_spin.valueChanged.connect(self._on_config_changed)
+        
+        speed_layout.addWidget(speed_label)
+        speed_layout.addWidget(self.move_speed_combo)
+        speed_layout.addWidget(self.custom_speed_spin)
+        speed_layout.addWidget(self.custom_random_label)
+        speed_layout.addWidget(self.custom_random_spin)
+        input_layout.addLayout(speed_layout)
+
+        # 锁定后执行
+        self.post_action_recorder = HotkeyRecorder(current_key="")
+        self.post_action_recorder.key_changed.connect(self._on_config_changed)
+        input_layout.addLayout(create_row("锁定后执行", self.post_action_recorder, "锁定目标后自动执行的操作，例如自动开火。可以是鼠标键或组合键。"))
+
+
         layout.addWidget(input_group)
 
-        layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding))
-
-        # 控制按钮
+        # 4. 控制按钮
+        layout.addStretch()
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(15)
         self.start_btn = QPushButton("启动系统")
         self.start_btn.setObjectName("start_btn")
         self.start_btn.setFixedHeight(45)
         self.start_btn.clicked.connect(self._start_clicked)
         
-        self.stop_btn = QPushButton("停止")
+        self.stop_btn = QPushButton("停止运行")
         self.stop_btn.setObjectName("stop_btn")
         self.stop_btn.setFixedHeight(45)
         self.stop_btn.setEnabled(False)
@@ -260,6 +762,7 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.start_btn)
         btn_layout.addWidget(self.stop_btn)
         layout.addLayout(btn_layout)
+
 
     def _init_tools_tab(self):
         layout = QVBoxLayout(self.tools_tab)
@@ -315,6 +818,34 @@ class MainWindow(QMainWindow):
         
         self.extract_mode_combo.currentIndexChanged.connect(self._update_extract_ui)
         layout.addWidget(settings_group)
+
+        # 小目标数据集优化工具
+        opt_group = QGroupBox("小目标数据集优化 (裁剪以放大目标)")
+        opt_layout = QVBoxLayout(opt_group)
+        
+        opt_desc = QLabel("方案：以标注框为中心裁剪 imgsz 大小的区域，从而在训练时“放大”目标。")
+        opt_desc.setStyleSheet("color: #ffffff; font-size: 12px;")
+        opt_layout.addWidget(opt_desc)
+
+        opt_input_layout = QHBoxLayout()
+        opt_label = QLabel("目标训练分辨率 (imgsz) (?)")
+        opt_tooltip = "选择您计划在训练时使用的图像尺寸。裁剪工具会生成此尺寸的图片，确保训练时不进行缩放，最大限度保留细节。"
+        opt_label.setToolTip(opt_tooltip)
+        opt_input_layout.addWidget(opt_label)
+        
+        self.opt_imgsz_combo = QComboBox()
+        self.opt_imgsz_combo.addItems(["640", "960", "1280"])
+        self.opt_imgsz_combo.setCurrentText("640")
+        self.opt_imgsz_combo.setToolTip(opt_tooltip)
+        opt_input_layout.addWidget(self.opt_imgsz_combo)
+        opt_layout.addLayout(opt_input_layout)
+
+        self.btn_optimize_dataset = QPushButton("开始优化数据集 (裁剪原图) (?)")
+        self.btn_optimize_dataset.setToolTip("自动扫描所有标注框，并以框为中心裁剪出固定大小的区域。这能让小目标在模型眼中变得‘巨大’，从而极大地提升训练效果。")
+        self.btn_optimize_dataset.clicked.connect(self._start_dataset_optimization)
+        opt_layout.addWidget(self.btn_optimize_dataset)
+        
+        layout.addWidget(opt_group)
 
         # 进度条
         self.progress_bar = QProgressBar()
@@ -381,44 +912,342 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.critical(self, "错误", message)
 
+    def _start_dataset_optimization(self):
+        """执行数据集优化裁剪"""
+        # 使用当前正在标注的目录作为默认源
+        source_dir = self.current_dir
+        if not source_dir:
+            source_dir = QFileDialog.getExistingDirectory(self, "选择待优化的数据集目录 (包含图片和 .txt)")
+            if not source_dir: return
+
+        target_dir = QFileDialog.getExistingDirectory(self, "选择优化后的保存目录 (建议为空目录)")
+        if not target_dir: return
+        
+        if os.path.abspath(source_dir) == os.path.abspath(target_dir):
+            QMessageBox.critical(self, "错误", "保存目录不能与源目录相同！")
+            return
+
+        imgsz = int(self.opt_imgsz_combo.currentText())
+        
+        msg = f"该工具将扫描目录下的所有标注，并以标注框为中心裁剪出 {imgsz}x{imgsz} 的区域。\n" \
+              f"这会使小目标在训练时看起来更大，从而提升识别效果。\n\n" \
+              f"源目录: {source_dir}\n" \
+              f"目标目录: {target_dir}\n\n" \
+              f"是否开始？"
+        
+        if QMessageBox.question(self, "确认优化", msg) != QMessageBox.Yes:
+            return
+
+        self.btn_optimize_dataset.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+
+        self.opt_thread = OptimizationThread(source_dir, target_dir, imgsz)
+        self.opt_thread.progress.connect(self.progress_bar.setValue)
+        self.opt_thread.finished.connect(self._on_optimization_finished)
+        self.opt_thread.start()
+
+    def _on_optimization_finished(self, success, message):
+        self.btn_optimize_dataset.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        if success:
+            QMessageBox.information(self, "完成", message)
+        else:
+            QMessageBox.critical(self, "错误", message)
+
     def _load_config_to_ui(self):
         self.conf_spin.setValue(self.config.get("inference.conf_thres"))
         self.debug_check.setChecked(self.config.get("gui.show_debug"))
-        self.smooth_spin.setValue(self.config.get("input.sensitivity"))
-        self.fov_spin.setValue(self.config.get("input.fov", 300))
+        self.overlay_check.setChecked(False) # 默认不开启，避免遮挡
+        self.fov_inference_check.setChecked(self.config.get("inference.use_fov_inference", False))
+        center_mode = self.config.get("inference.fov_center_mode", "screen")
+        self.fov_center_combo.setCurrentText("屏幕中心" if center_mode == "screen" else "鼠标位置")
+        
+        trigger_mode = self.config.get("input.trigger_mode", "manual")
+        self.trigger_mode_combo.setCurrentIndex(0 if trigger_mode == "manual" else 1)
+        
+        self.trigger_key_recorder.set_key(self.config.get("input.trigger_key", "Shift"))
+        self.toggle_key_recorder.set_key(self.config.get("input.toggle_key", "F9"))
+
+        # 行为设置加载
+        self.auto_lock_check.setChecked(self.config.get("input.auto_lock", True))
+        self.auto_move_check.setChecked(self.config.get("input.auto_move", True))
+        self.fov_spin.setValue(self.config.get("input.fov", 500))
+        
+        move_speed = self.config.get("input.move_speed", "normal")
+        speed_map = {"fast": "极快", "fast_medium": "快速", "normal": "正常", "slow": "慢速", "custom": "自定义(ms)"}
+        idx = self.move_speed_combo.findText(speed_map.get(move_speed, "正常"))
+        if idx >= 0: self.move_speed_combo.setCurrentIndex(idx)
+        
+        self.custom_speed_spin.setValue(self.config.get("input.custom_speed_ms", 10))
+        self.custom_random_spin.setValue(self.config.get("input.custom_speed_random", 5))
+        self.human_curve_check.setChecked(self.config.get("input.human_curve", False))
+        self.offset_spin.setValue(self.config.get("input.offset_radius", 0))
+        self.post_action_recorder.set_key(self.config.get("input.post_action", ""))
+
+        # 启动全局热键轮询定时器
+        self.toggle_timer = QTimer(self)
+        self.toggle_timer.timeout.connect(self._check_global_toggle)
+        self.toggle_timer.start(30) # 30ms 检测一次 (提高响应速度)
+        self._last_toggle_state = False
+
+        self._update_ui_state_by_mode()
+
+    def _check_global_toggle(self):
+        """轮询全局启停快捷键"""
+        mode_idx = self.trigger_mode_combo.currentIndex()
+        
+        # 1. Hold 模式 (长按热键启动)
+        if mode_idx == 1:
+            key = self.trigger_key_recorder.get_key()
+            if not key: return
+            
+            is_pressed = is_hotkey_pressed(key)
+            
+            # 状态同步：按住时运行，松开时停止
+            if is_pressed:
+                if self.controller and not self.controller.running:
+                    self._start_clicked()
+            else:
+                if self.controller and self.controller.running:
+                    self._stop_clicked()
+            return
+
+        # 2. Manual 模式 (点击按钮启动)
+        # 检查全局启停快捷键 (toggle_key)
+        key = self.toggle_key_recorder.get_key()
+        if not key:
+            return
+            
+        is_pressed = is_hotkey_pressed(key)
+        
+        # 边缘检测：按下时触发一次
+        if is_pressed and not self._last_toggle_state:
+            if self.controller and self.controller.running:
+                self._stop_clicked()
+                print(f"[System] 快捷键 {key} 触发停止")
+            else:
+                self._start_clicked()
+                print(f"[System] 快捷键 {key} 触发启动")
+                
+        self._last_toggle_state = is_pressed
+
+    def _update_ui_state_by_mode(self):
+        """根据当前启动模式，更新 UI 控件的启用/禁用状态"""
+        mode_idx = self.trigger_mode_combo.currentIndex()
+        # 0: 点击启动按钮后生效 (Manual)
+        # 1: 长按热键生效 (Hold)
+        
+        if mode_idx == 0:
+            # Manual 模式: 禁用长按触发键，启用启停快捷键
+            self.trigger_key_recorder.setEnabled(False)
+            self.toggle_key_recorder.setEnabled(True)
+            # 按钮状态由 _update_status 接管，但这里先重置一下
+            self.start_btn.setEnabled(not (self.controller and self.controller.running))
+            self.stop_btn.setEnabled(self.controller and self.controller.running)
+            self.start_btn.setText("启动系统")
+        else:
+            # Hold 模式: 启用长按触发键，禁用启停快捷键
+            self.trigger_key_recorder.setEnabled(True)
+            self.toggle_key_recorder.setEnabled(False)
+            # 禁用启动/停止按钮 (由热键全权控制)
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self.start_btn.setText("请长按热键启动")
 
     def _on_config_changed(self):
-        # 更新配置对象并保存
         conf_val = self.conf_spin.value()
         debug_val = self.debug_check.isChecked()
-        smooth_val = self.smooth_spin.value()
+        overlay_val = self.overlay_check.isChecked()
+        fov_inf_val = self.fov_inference_check.isChecked()
+        
+        center_mode_val = "screen" if self.fov_center_combo.currentText() == "屏幕中心" else "mouse"
+        
+        trigger_mode_val = "manual" if self.trigger_mode_combo.currentIndex() == 0 else "hold"
+        trigger_key_val = self.trigger_key_recorder.get_key()
+        toggle_key_val = self.toggle_key_recorder.get_key()
+        
+        # 行为设置获取
+        auto_lock_val = self.auto_lock_check.isChecked()
+        auto_move_val = self.auto_move_check.isChecked()
         fov_val = self.fov_spin.value()
+        
+        speed_text = self.move_speed_combo.currentText()
+        speed_map_rev = {"极快": "fast", "快速": "fast_medium", "正常": "normal", "慢速": "slow", "自定义(ms)": "custom"}
+        move_speed_val = speed_map_rev.get(speed_text, "normal")
+        
+        # 控制自定义速度输入框可见性
+        is_custom = (speed_text == "自定义(ms)")
+        self.custom_speed_spin.setVisible(is_custom)
+        self.custom_random_label.setVisible(is_custom)
+        self.custom_random_spin.setVisible(is_custom)
+        
+        custom_speed_val = self.custom_speed_spin.value()
+        custom_random_val = self.custom_random_spin.value()
+        
+        human_curve_val = self.human_curve_check.isChecked()
+        offset_val = self.offset_spin.value()
+        post_action_val = self.post_action_recorder.get_key()
 
+        # 更新 UI 状态
+        self._update_ui_state_by_mode()
+
+        # 保存到配置
         self.config.set("inference.conf_thres", conf_val)
         self.config.set("gui.show_debug", debug_val)
-        self.config.set("input.sensitivity", smooth_val)
+        self.config.set("inference.use_fov_inference", fov_inf_val)
+        self.config.set("inference.fov_center_mode", center_mode_val)
+        self.config.set("input.trigger_mode", trigger_mode_val)
+        self.config.set("input.trigger_key", trigger_key_val)
+        self.config.set("input.toggle_key", toggle_key_val)
+        
+        self.config.set("input.auto_lock", auto_lock_val)
+        self.config.set("input.auto_move", auto_move_val)
         self.config.set("input.fov", fov_val)
+        self.config.set("input.move_speed", move_speed_val)
+        self.config.set("input.custom_speed_ms", custom_speed_val)
+        self.config.set("input.custom_speed_random", custom_random_val)
+        self.config.set("input.human_curve", human_curve_val)
+        self.config.set("input.offset_radius", offset_val)
+        self.config.set("input.post_action", post_action_val)
         
         # 同步到控制器
         if self.controller:
-            self.controller.inference.conf_thres = conf_val
+            if hasattr(self.controller, 'inference'):
+                self.controller.inference.conf_thres = conf_val
+            else:
+                self.controller.conf_thres = conf_val
+                
             self.controller.show_debug = debug_val
-            # 将 UI 的平滑度 (1.0-10.0) 映射为秒数 (0.01s - 0.2s)
-            self.controller.smooth_duration = smooth_val * 0.02 
-            self.controller.smooth_move = smooth_val > 1.0
+            self.controller.use_fov_inference = fov_inf_val
+            self.controller.fov_center_mode = center_mode_val
+            self.controller.trigger_mode = trigger_mode_val
+            self.controller.trigger_key = trigger_key_val
+            
+            # 行为设置同步
+            self.controller.auto_lock = auto_lock_val
+            self.controller.auto_move = auto_move_val
             self.controller.fov_size = fov_val
+            self.controller.move_speed = move_speed_val
+            self.controller.custom_speed_ms = custom_speed_val
+            self.controller.custom_speed_random = custom_random_val
+            self.controller.human_curve = human_curve_val
+            self.controller.offset_radius = offset_val
+            self.controller.post_action = post_action_val
 
     def _update_status(self):
         if self.controller and self.controller.running:
             self.status_indicator.setStyleSheet("color: #107c10; font-size: 18px;")
             self.status_text.setText("系统运行中")
-            self.start_btn.setEnabled(False)
-            self.stop_btn.setEnabled(True)
         else:
             self.status_indicator.setStyleSheet("color: #d83b01; font-size: 18px;")
             self.status_text.setText("系统已停止")
-            self.start_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
+            
+        # 根据启动模式更新按钮状态
+        mode_idx = self.trigger_mode_combo.currentIndex()
+        if mode_idx == 1: # Hold mode
+             self.start_btn.setEnabled(False)
+             self.stop_btn.setEnabled(False)
+             self.start_btn.setText("请长按热键启动")
+        else:
+             # Manual mode
+             is_running = self.controller and self.controller.running
+             self.start_btn.setEnabled(not is_running)
+             self.stop_btn.setEnabled(is_running)
+             self.start_btn.setText("启动系统")
+
+    def _process_preview(self):
+        """处理预览窗口和Overlay更新"""
+        show_debug = self.debug_check.isChecked()
+        show_overlay = self.overlay_check.isChecked()
+        
+        # 只要有一个需要显示，就确保 Controller 开启 debug 模式
+        if self.controller:
+            self.controller.show_debug = (show_debug or show_overlay)
+
+        if self.controller and (show_debug or show_overlay):
+            # 1. 确保窗口状态正确
+            # 预览窗口
+            if show_debug:
+                if self.preview_window is None:
+                    self.preview_window = PreviewWindow(self)
+                    self.preview_window.show()
+                    self._exclude_from_capture(self.preview_window)
+            else:
+                if self.preview_window is not None:
+                    self.preview_window.close()
+                    self.preview_window = None
+
+            # Overlay 窗口
+            if show_overlay:
+                if self.overlay_window is None:
+                    self.overlay_window = OverlayWindow()
+                    self.overlay_window.show()
+                    self._exclude_from_capture(self.overlay_window)
+            else:
+                if self.overlay_window is not None:
+                    self.overlay_window.close()
+                    self.overlay_window = None
+            
+            # 2. 从队列获取最新数据包
+            debug_data = None
+            try:
+                while not self.controller.debug_queue.empty():
+                    debug_data = self.controller.debug_queue.get_nowait()
+            except Exception:
+                pass
+            
+            if debug_data is not None:
+                # debug_data = {'frame': frame, 'results': results, 'target': target, 'center': (cx, cy), 'fov_size': fov}
+                frame = debug_data['frame']
+                results = debug_data['results']
+                target = debug_data['target']
+                center = debug_data['center']
+                fov_size = debug_data['fov_size']
+
+                # 更新预览窗口 (需要画框)
+                if self.preview_window:
+                    # 在 UI 线程绘制，避免修改原始 frame
+                    # 使用 frame.copy() 或者直接在 QImage 上操作
+                    # 这里为了方便，我们先在 frame 上画，但最好不要
+                    import cv2
+                    disp_frame = frame.copy()
+                    
+                    # 绘制 FOV
+                    cv2.circle(disp_frame, center, int(fov_size / 2), (255, 255, 255), 1)
+                    
+                    # 绘制结果
+                    for (x1, y1, x2, y2, conf, cls) in results:
+                        color = (0, 255, 0)
+                        if target is not None and x1 == target[0] and y1 == target[1]:
+                            color = (0, 0, 255)
+                        cv2.rectangle(disp_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                        
+                    self.preview_window.update_frame(disp_frame)
+
+                # 更新 Overlay
+                if self.overlay_window:
+                    fps = debug_data.get('fps', 0)
+                    self.overlay_window.update_data(results, target, center, fov_size / 2, fps)
+        else:
+            # 全部关闭
+            if self.preview_window is not None:
+                self.preview_window.close()
+                self.preview_window = None
+            if self.overlay_window is not None:
+                self.overlay_window.close()
+                self.overlay_window = None
+
+    def _exclude_from_capture(self, window):
+        """设置窗口不被截屏软件捕捉"""
+        try:
+            hwnd = window.winId()
+            # WDA_EXCLUDEFROMCAPTURE = 0x00000011 (Win10 2004+)
+            if not ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011):
+                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000001)
+        except Exception as e:
+            print(f"Exclude from capture failed: {e}")
 
     def _init_label_tab(self):
         main_layout = QHBoxLayout(self.label_tab)
@@ -1006,6 +1835,14 @@ class MainWindow(QMainWindow):
         YOLOHelper.save_labels(label_path, self.canvas.boxes, px.width(), px.height())
 
     def _start_clicked(self):
+        # 强制同步关键配置，防止 UI 状态与控制器不同步
+        trigger_mode = "manual" if self.trigger_mode_combo.currentIndex() == 0 else "hold"
+        self.controller.trigger_mode = trigger_mode
+        self.controller.trigger_key = self.trigger_key_recorder.get_key()
+        
+        # 打印调试信息
+        print(f"[UI] 启动系统: 模式={trigger_mode}, 触发键={self.controller.trigger_key}")
+        
         show_debug = self.debug_check.isChecked()
         self.controller.start(show_debug=show_debug)
         self._update_status()
@@ -1013,6 +1850,420 @@ class MainWindow(QMainWindow):
     def _stop_clicked(self):
         self.controller.stop()
         self._update_status()
+
+    def _init_model_tab(self):
+        layout = QVBoxLayout(self.model_tab)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(15)
+
+        # 1. 模型选择部分
+        model_group = QGroupBox("模型选择")
+        model_layout = QVBoxLayout(model_group)
+        
+        sel_layout = QHBoxLayout()
+        sel_layout.addWidget(QLabel("当前模型:"))
+        self.model_combo = QComboBox()
+        self._refresh_model_list()
+        self.model_combo.currentTextChanged.connect(self._on_model_selection_changed)
+        sel_layout.addWidget(self.model_combo, 1)
+        
+        btn_browse_model = QPushButton("浏览...")
+        btn_browse_model.clicked.connect(self._browse_model)
+        sel_layout.addWidget(btn_browse_model)
+        model_layout.addLayout(sel_layout)
+        
+        self.model_info_label = QLabel("提示: 基础模型 base.pt 用于推理和作为训练起点。")
+        self.model_info_label.setStyleSheet("color: #888888; font-size: 11px;")
+        model_layout.addWidget(self.model_info_label)
+        
+        layout.addWidget(model_group)
+
+        # 2. 模型训练部分
+        train_group = QGroupBox("模型训练 (YOLOv8)")
+        train_layout = QVBoxLayout(train_group)
+        
+        # 显示当前使用的基础模型
+        self.train_base_model_label = QLabel(f"当前训练基础权重: {os.path.basename(self.config.get('inference.model_path', 'base.pt'))}")
+        self.train_base_model_label.setStyleSheet("color: #0078d4; font-weight: bold; margin-bottom: 5px;")
+        train_layout.addWidget(self.train_base_model_label)
+        
+        # 数据集路径
+        ds_layout = QHBoxLayout()
+        ds_layout.addWidget(QLabel("数据集目录:"))
+        self.train_ds_edit = QLineEdit()
+        self.train_ds_edit.setPlaceholderText("选择包含 images/labels 的整理后的目录...")
+        btn_browse_ds = QPushButton("选择")
+        btn_browse_ds.clicked.connect(self._browse_train_dataset)
+        ds_layout.addWidget(self.train_ds_edit)
+        ds_layout.addWidget(btn_browse_ds)
+        train_layout.addLayout(ds_layout)
+
+        # 训练参数
+        params_layout = QVBoxLayout()
+        
+        row1 = QHBoxLayout()
+        # 轮次
+        row1.addWidget(QLabel("训练轮次 (Epochs) (?)"))
+        self.epochs_spin = QSpinBox()
+        self.epochs_spin.setRange(1, 2000)
+        self.epochs_spin.setValue(200)
+        self.epochs_spin.setToolTip("整个数据集将被训练多少遍。通常 100-300 轮能获得较好效果。")
+        row1.addWidget(self.epochs_spin)
+        
+        row1.addSpacing(20)
+        
+        # 工作线程
+        row1.addWidget(QLabel("工作线程 (Workers) (?)"))
+        self.workers_spin = QSpinBox()
+        self.workers_spin.setRange(0, 16)
+        self.workers_spin.setValue(2)
+        self.workers_spin.setToolTip("加载数据的并行线程数。对于大多数 PC，设置为 2-4 即可。如果训练报错，尝试设为 0。")
+        row1.addWidget(self.workers_spin)
+        row1.addStretch()
+        params_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        # Batch Size
+        row2.addWidget(QLabel("批大小 (Batch) (?)"))
+        self.batch_spin = QSpinBox()
+        self.batch_spin.setRange(-1, 256)
+        self.batch_spin.setValue(16)
+        self.batch_spin.setSpecialValueText("自动 (-1)")
+        self.batch_spin.setToolTip("每次模型参数更新所使用的图片数量。显存越大可设置越高。设为 -1 则由系统自动调整。")
+        row2.addWidget(self.batch_spin)
+        
+        row2.addSpacing(20)
+        
+        # imgsz
+        row2.addWidget(QLabel("训练分辨率 (imgsz) (?)"))
+        self.imgsz_combo = QComboBox()
+        self.imgsz_combo.addItems(["320", "640", "960", "1280", "1600", "1920"])
+        self.imgsz_combo.setCurrentText("640")
+        self.imgsz_combo.setToolTip("训练时图片缩放的大小。值越大精度越高，但训练越慢且越占显存。通常 640 是平衡点。")
+        row2.addWidget(self.imgsz_combo)
+        row2.addStretch()
+        params_layout.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        # Cache
+        self.cache_check = QCheckBox("启用数据缓存 (Cache) (?)")
+        self.cache_check.setToolTip("将处理后的图片预加载到内存。这能极大地提升训练速度（通常快 2-3 倍），但需要较大的内存空间。")
+        self.cache_check.setChecked(True)
+        row3.addWidget(self.cache_check)
+        row3.addStretch()
+        params_layout.addLayout(row3)
+        
+        train_layout.addLayout(params_layout)
+
+        # 导出目录
+        exp_layout = QHBoxLayout()
+        exp_layout.addWidget(QLabel("导出结果目录:"))
+        self.train_exp_edit = QLineEdit()
+        self.train_exp_edit.setText(get_abs_path("train_results"))
+        self.train_exp_edit.setPlaceholderText("选择训练结果导出目录...")
+        btn_browse_exp = QPushButton("选择")
+        btn_browse_exp.clicked.connect(self._browse_train_export)
+        exp_layout.addWidget(self.train_exp_edit)
+        exp_layout.addWidget(btn_browse_exp)
+        train_layout.addLayout(exp_layout)
+
+        # 训练日志
+        train_layout.addWidget(QLabel("训练日志:"))
+        self.train_log = QPlainTextEdit()
+        self.train_log.setReadOnly(True)
+        self.train_log.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas;")
+        train_layout.addWidget(self.train_log)
+
+        # 训练进度
+        self.train_progress = QProgressBar()
+        self.train_progress.setVisible(False)
+        self.train_progress.setTextVisible(True)
+        self.train_progress.setAlignment(Qt.AlignCenter)
+        self.train_progress.setFormat("训练进度: %p%")
+        self.train_progress.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #444;
+                border-radius: 4px;
+                background-color: #444444;
+                text-align: center;
+                color: white;
+                height: 20px;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background-color: #28a745;
+                border-radius: 2px;
+            }
+        """)
+        train_layout.addWidget(self.train_progress)
+
+        # 训练按钮布局
+        btn_train_layout = QHBoxLayout()
+        
+        # 开始训练按钮
+        self.btn_start_train = QPushButton("开始训练")
+        self.btn_start_train.setFixedHeight(40)
+        self.btn_start_train.setStyleSheet("background-color: #0078d4; font-weight: bold;")
+        self.btn_start_train.clicked.connect(self._start_training)
+        btn_train_layout.addWidget(self.btn_start_train, 2)
+        
+        # 停止训练按钮
+        self.btn_stop_train = QPushButton("停止训练")
+        self.btn_stop_train.setFixedHeight(40)
+        self.btn_stop_train.setEnabled(False) # 初始禁用
+        self.btn_stop_train.setStyleSheet("background-color: #d83b01; font-weight: bold;")
+        self.btn_stop_train.clicked.connect(self._stop_training)
+        btn_train_layout.addWidget(self.btn_stop_train, 1)
+        
+        train_layout.addLayout(btn_train_layout)
+
+        layout.addWidget(train_group)
+        layout.addStretch()
+
+    def _refresh_model_list(self):
+        """刷新根目录下的模型列表"""
+        self.model_combo.blockSignals(True) # 暂时阻塞信号，避免刷新时重复触发加载
+        self.model_combo.clear()
+        root = get_root_path()
+        
+        # 1. 添加内置模型 (项目根目录下的 .pt 文件，只显示文件名)
+        models = [f for f in os.listdir(root) if f.endswith(".pt")]
+        if not models:
+            models = ["base.pt"]
+        self.model_combo.addItems(models)
+        
+        # 2. 处理当前配置的显示
+        current = self.config.get("inference.model_path", "base.pt")
+        
+        # 检查当前配置项是否已经在下拉列表中 (文件名或已存的绝对路径)
+        idx = self.model_combo.findText(current)
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        else:
+            # 如果是外部路径且不在列表中，手动添加并显示全路径
+            self.model_combo.addItem(current)
+            self.model_combo.setCurrentText(current)
+        
+        self.model_combo.blockSignals(False)
+        
+        # 同步更新训练部分的基础模型显示 (统一只显示简名)
+        if hasattr(self, 'train_base_model_label'):
+            self.train_base_model_label.setText(f"当前训练基础权重: {os.path.basename(current)}")
+
+    def _on_model_selection_changed(self, model_name):
+        if not model_name: return
+        
+        # 此时 model_name 是下拉框中显示的文本
+        # 逻辑：
+        # 1. 如果是绝对路径，说明是外部模型，配置保存全路径，加载也用全路径
+        # 2. 如果是文件名，说明是内置模型，配置保存文件名，加载时拼接根目录
+        
+        if os.path.isabs(model_name):
+            full_path = model_name
+            save_val = model_name
+        else:
+            full_path = get_abs_path(model_name)
+            save_val = model_name
+            
+        self.config.set("inference.model_path", save_val)
+        
+        # 同步更新训练部分的基础模型显示
+        if hasattr(self, 'train_base_model_label'):
+            self.train_base_model_label.setText(f"当前训练基础权重: {os.path.basename(full_path)}")
+            
+        # 如果控制器已启动，尝试实时更新模型
+        if self.controller:
+            self.controller.model_path = full_path
+            if self.controller.running:
+                # 提示用户模型已实时加载
+                self.status_text.setText(f"系统运行中 (模型已更新: {os.path.basename(full_path)})")
+
+    def _browse_model(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择模型文件", get_root_path(), "YOLO Models (*.pt)")
+        if path:
+            root = get_root_path()
+            name = os.path.basename(path)
+            
+            # 确定显示和保存的文本
+            # 如果选择的模型在项目根目录下，只显示文件名；否则显示全路径
+            display_text = name if path.startswith(root) else path
+
+            # 检查是否已经在 combo 中
+            idx = self.model_combo.findText(display_text)
+            if idx < 0:
+                self.model_combo.addItem(display_text)
+                idx = self.model_combo.count() - 1
+            
+            # 切换到该项 (会触发 _on_model_selection_changed)
+            self.model_combo.setCurrentIndex(idx)
+
+    def _browse_train_dataset(self):
+        path = QFileDialog.getExistingDirectory(self, "选择整理后的数据集目录")
+        if path:
+            self.train_ds_edit.setText(path)
+            # 检查数据量
+            img_train_dir = os.path.join(path, "images", "train")
+            if os.path.exists(img_train_dir):
+                count = len([f for f in os.listdir(img_train_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+                if count < 50:
+                    QMessageBox.warning(self, "警告", f"检测到训练集图片仅有 {count} 张。数据量少于 50 张，训练效果可能不理想，建议继续标注。")
+
+    def _browse_train_export(self):
+        path = QFileDialog.getExistingDirectory(self, "选择训练结果导出目录")
+        if path:
+            self.train_exp_edit.setText(path)
+
+    def _stop_training(self):
+        if not hasattr(self, 'training_thread') or not self.training_thread.isRunning():
+            return
+            
+        reply = QMessageBox.question(self, "停止确认", "确定要停止当前正在进行的训练吗？\n停止后可能无法保存当前进度的权重。", 
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            self.train_log.appendPlainText("\n[提示] 正在请求停止训练，请稍候...")
+            self.btn_stop_train.setEnabled(False)
+            self.training_thread.stop()
+
+    def _start_training(self):
+        dataset_path = self.train_ds_edit.text()
+        if not dataset_path:
+            QMessageBox.warning(self, "错误", "请先选择数据集目录。")
+            return
+            
+        # 验证 data.yaml 是否存在，或者更新其中的路径
+        yaml_path = os.path.join(dataset_path, "data.yaml")
+        
+        # 无论文件是否存在，我们都尝试读取并更新 path 字段，确保它指向用户当前选择的目录
+        classes = []
+        try:
+            self.train_log.clear()
+            self.train_log.appendPlainText("--- 正在检查训练配置 ---")
+            
+            classes_file = os.path.join(dataset_path, "classes.txt")
+            if not os.path.exists(classes_file):
+                classes_file = os.path.join(dataset_path, "labels", "classes.txt")
+            
+            if os.path.exists(classes_file):
+                with open(classes_file, "r", encoding="utf-8") as f:
+                    classes = [line.strip() for line in f if line.strip()]
+            
+            import yaml
+            data_config = {}
+            if os.path.exists(yaml_path):
+                with open(yaml_path, "r", encoding="utf-8") as f:
+                    data_config = yaml.safe_load(f) or {}
+                self.train_log.appendPlainText(f"检测到已存在的 data.yaml，正在同步路径...")
+            else:
+                self.train_log.appendPlainText(f"未检测到 data.yaml，正在根据 classes.txt 自动生成...")
+            
+            # 自动探测数据集结构
+            def find_rel_path(base, target_sub_path):
+                # 尝试几种常见的 YOLO 格式
+                candidates = [
+                    target_sub_path, # 如 images/train
+                    target_sub_path.replace("/", "\\"), # Windows 风格
+                    os.path.join("train", "images") if "train" in target_sub_path else os.path.join("val", "images"),
+                ]
+                for c in candidates:
+                    if os.path.exists(os.path.join(base, c)):
+                        return c.replace("\\", "/") # 统一使用正斜杠
+                return None
+
+            train_rel = find_rel_path(dataset_path, "images/train")
+            val_rel = find_rel_path(dataset_path, "images/val")
+
+            if not train_rel:
+                # 兜底：如果没找到 images/train，检查根目录下是否有 images 文件夹
+                if os.path.exists(os.path.join(dataset_path, "images")):
+                    train_rel = "images"
+                    val_rel = "images" # 这种情况下通常 val 也用同一个
+                else:
+                    QMessageBox.critical(self, "错误", "无法在数据集目录中找到图像文件夹 (images/train)。请确保数据集结构符合 YOLO 格式。")
+                    return
+
+            # 强制更新关键路径，确保在当前环境下可运行
+            # 使用绝对路径以彻底绕过 Ultralytics settings.json 中的 datasets_dir 限制
+            abs_dataset_path = dataset_path.replace("\\", "/")
+            data_config['path'] = abs_dataset_path
+            data_config['train'] = os.path.join(dataset_path, train_rel).replace("\\", "/")
+            data_config['val'] = os.path.join(dataset_path, val_rel if val_rel else train_rel).replace("\\", "/")
+            
+            if classes:
+                data_config['names'] = {i: name for i, name in enumerate(classes)}
+            elif 'names' not in data_config:
+                QMessageBox.critical(self, "错误", "在数据集目录中找不到 classes.txt，且 data.yaml 中也没有类别定义。无法训练。")
+                return
+            
+            # 使用简单的文件写入，避免 yaml.dump 可能产生的格式问题（如 !!python/object）
+            with open(yaml_path, "w", encoding="utf-8") as f:
+                f.write(f"path: {data_config['path']}\n")
+                f.write(f"train: {data_config['train']}\n")
+                f.write(f"val: {data_config['val']}\n\n")
+                f.write("names:\n")
+                for i, name in data_config['names'].items():
+                    f.write(f"  {i}: {name}\n")
+            
+            self.train_log.appendPlainText(f"配置完成: {yaml_path}")
+            self.train_log.appendPlainText(f"训练路径 (Train): {data_config['train']}")
+            self.train_log.appendPlainText(f"验证路径 (Val): {data_config['val']}")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"配置 data.yaml 失败: {e}")
+            return
+
+        # 检查轮次
+        epochs = self.epochs_spin.value()
+        if epochs < 50:
+            QMessageBox.information(self, "建议", "推荐训练轮次为 150~200 轮，以获得较好的收敛效果。")
+
+        # 准备训练
+        raw_model_path = self.config.get("inference.model_path", "base.pt")
+        # 确保基础模型是绝对路径
+        model_path = get_abs_path(raw_model_path) if not os.path.isabs(raw_model_path) else raw_model_path
+        
+        workers = self.workers_spin.value()
+        batch = self.batch_spin.value()
+        imgsz = int(self.imgsz_combo.currentText())
+        cache = self.cache_check.isChecked()
+        project_dir = self.train_exp_edit.text()
+
+        self.train_log.appendPlainText(f"\n--- 准备开始训练 ---")
+        self.train_log.appendPlainText(f"基础模型: {model_path}")
+        self.train_log.appendPlainText(f"配置文件: {yaml_path}")
+        self.train_log.appendPlainText(f"训练轮次: {epochs}")
+        self.train_log.appendPlainText(f"训练分辨率: {imgsz}")
+        self.train_log.appendPlainText(f"工作线程: {workers}")
+        self.train_log.appendPlainText(f"批大小 (Batch): {'自动' if batch == -1 else batch}")
+        self.train_log.appendPlainText(f"数据缓存: {'开启' if cache else '关闭'}")
+        self.train_log.appendPlainText(f"------------------\n")
+
+        self.btn_start_train.setEnabled(False)
+        self.btn_stop_train.setEnabled(True)
+        self.train_progress.setVisible(True)
+        # 使用 100 倍精度实现平滑进度显示 (从 epoch 级别细化到 batch 级别)
+        self.train_progress.setRange(0, epochs * 100)
+        self.train_progress.setValue(0)
+
+        self.training_thread = TrainingThread(model_path, yaml_path, epochs, workers, project_dir, batch, cache, imgsz)
+        self.training_thread.progress.connect(lambda msg: self.train_log.appendPlainText(msg))
+        self.training_thread.epoch_progress.connect(lambda curr, total: self.train_progress.setValue(curr))
+        self.training_thread.finished.connect(self._on_training_finished)
+        self.training_thread.start()
+
+    def _on_training_finished(self, success, message):
+        self.btn_start_train.setEnabled(True)
+        self.btn_stop_train.setEnabled(False)
+        if success:
+            self.train_progress.setValue(self.train_progress.maximum())
+            QMessageBox.information(self, "训练完成", message)
+            self.train_log.appendPlainText(f"\n[完成] {message}")
+            # 训练完成后刷新模型列表，方便用户选择新训练的模型
+            self._refresh_model_list()
+        else:
+            self.train_progress.setVisible(False)
+            QMessageBox.critical(self, "训练失败", message)
+            self.train_log.appendPlainText(f"\n[错误] {message}")
 
     def closeEvent(self, event):
         self.controller.stop()

@@ -11,7 +11,7 @@ from inference import YOLOInference
 def test_inference():
     print("--- 开始 Inference 模块验证 ---")
     
-    model_path = "yolov8n.pt"
+    model_path = "base.pt"
     if not os.path.exists(model_path):
         print(f"警告: 找不到模型文件 {model_path}，将自动下载 (首次运行可能较慢)...")
     

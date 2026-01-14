@@ -11,7 +11,7 @@ class AbstractInput(ABC):
         pass
 
     @abstractmethod
-    def smooth_move_to(self, x: int, y: int, duration: float = 0.1):
+    def smooth_move_to(self, x: int, y: int, duration: float = 0.1, human_curve: bool = False):
         """平滑地移动鼠标到绝对坐标 (拟人化)"""
         pass
 
@@ -21,7 +21,7 @@ class AbstractInput(ABC):
         pass
 
     @abstractmethod
-    def smooth_move_rel(self, dx: int, dy: int, duration: float = 0.1):
+    def smooth_move_rel(self, dx: int, dy: int, duration: float = 0.1, human_curve: bool = False):
         """平滑地相对移动鼠标 (拟人化)"""
         pass
 

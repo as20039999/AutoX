@@ -17,7 +17,7 @@ def main():
 
     # 2. 初始化推理引擎
     print("正在初始化推理引擎...")
-    model_path = "yolov8n.pt" 
+    model_path = "base.pt" 
     infer = YOLOInference(model_path=model_path, conf_thres=0.3)
 
     # 3. 创建固定的显示窗口，防止重复创建
