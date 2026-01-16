@@ -9,7 +9,7 @@ class ConfigManager:
     """
     DEFAULT_CONFIG = {
         "inference": {
-            "model_path": "base.pt",
+            "model_path": "yolo26n.pt",
             "conf_thres": 0.4,
             "iou_thres": 0.45,
             "device": "cuda",
@@ -18,13 +18,16 @@ class ConfigManager:
         "input": {
             "fov": 500,
             "auto_lock": True,
-            "auto_move": True,
             "move_speed": "normal", # fast, normal, slow, custom
             "custom_speed_ms": 10,
             "custom_speed_random": 5,
             "human_curve": False,
             "offset_radius": 0,
-            "post_action": "" # e.g., "LButton", "RButton", "Ctrl+A"
+            "mouse_sensitivity": 1.0,
+            "move_key": "RButton",
+            "post_action": "", # e.g., "LButton", "RButton", "Ctrl+A"
+            "post_action_count": 1,
+            "post_action_interval_ms": 10
         },
         "gui": {
             "theme": "dark",

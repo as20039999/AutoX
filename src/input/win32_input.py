@@ -29,8 +29,17 @@ class Win32Input(AbstractInput):
         if flags & MOUSEEVENTF_ABSOLUTE:
             x = int(x * 65535 / self.screen_width)
             y = int(y * 65535 / self.screen_height)
-            
-        self.user32.mouse_event(flags, x, y, data, 0)
+        
+        # 终极防御：限制 x, y 在 C int32 范围内，防止 OverflowError
+        # mouse_event 的参数是 DWORD, LONG, LONG, DWORD, ULONG_PTR
+        # LONG 是 32 位有符号整数 (-2,147,483,648 到 2,147,483,647)
+        try:
+            x = max(-2147483648, min(2147483647, int(x)))
+            y = max(-2147483648, min(2147483647, int(y)))
+            self.user32.mouse_event(flags, x, y, data, 0)
+        except OverflowError:
+            # 如果依然溢出（理论上 int(x) 已经解决了 Python 层面的问题），打印并跳过
+            print(f"[Input] 鼠标事件坐标溢出: x={x}, y={y}")
 
     def move_to(self, x: int, y: int):
         self._send_mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, x, y)

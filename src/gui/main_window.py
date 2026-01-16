@@ -321,7 +321,8 @@ class TrainingThread(QThread):
                     project=project_path,
                     name=run_name,
                     exist_ok=True,
-                    verbose=True # 确保输出详细日志
+                    patience=20, # 连续 20 轮无优化则停止
+                    verbose=False # 关闭详细日志输出，仅显示每轮摘要
                 )
             finally:
                 # 无论成功失败，都移除处理器
@@ -435,6 +436,56 @@ class OptimizationThread(QThread):
         except Exception as e:
             self.finished.emit(False, f"优化过程中发生错误: {e}")
 
+class ExportTRTThread(QThread):
+    progress = Signal(int)
+    log_signal = Signal(str)
+    finished = Signal(bool, str)
+
+    def __init__(self, model_path, imgsz, half=True):
+        super().__init__()
+        self.model_path = model_path
+        self.imgsz = imgsz
+        self.half = half
+
+    def run(self):
+        from ultralytics import YOLO
+        import sys
+        import io
+
+        class StreamToSignal(io.TextIOBase):
+            def __init__(self, signal):
+                self.signal = signal
+            def write(self, s):
+                if s.strip():
+                    self.signal.emit(s.strip())
+                return len(s)
+
+        # 保存原始 stdout
+        old_stdout = sys.stdout
+        sys.stdout = StreamToSignal(self.log_signal)
+
+        try:
+            self.log_signal.emit(f"开始导出模型: {os.path.basename(self.model_path)}")
+            self.log_signal.emit(f"参数: imgsz={self.imgsz}, half={self.half}")
+            self.log_signal.emit("提示: TensorRT 导出可能需要 3-10 分钟，请耐心等待...")
+            
+            model = YOLO(self.model_path)
+            # 执行导出
+            export_path = model.export(
+                format='engine',
+                imgsz=self.imgsz,
+                half=self.half,
+                simplify=True,
+                workspace=4
+            )
+            
+            self.finished.emit(True, f"导出成功！模型已保存至:\n{export_path}")
+        except Exception as e:
+            self.finished.emit(False, f"导出失败: {str(e)}")
+        finally:
+            # 还原 stdout
+            sys.stdout = old_stdout
+
 class MainWindow(QMainWindow):
     def __init__(self, controller, config: ConfigManager):
         super().__init__()
@@ -442,6 +493,7 @@ class MainWindow(QMainWindow):
         self.config = config
         self.preview_window = None
         self.overlay_window = None
+        self._loading_config = False
         
         self.setWindowTitle("AutoX - AI 控制中心")
         
@@ -500,6 +552,10 @@ class MainWindow(QMainWindow):
         self.model_tab = QWidget()
         self._init_model_tab()
         self.tabs.addTab(self.model_tab, "模型管理")
+        
+        self.game_tab = QWidget()
+        self._init_game_tab()
+        self.tabs.addTab(self.game_tab, "游戏中心")
         
         self.init_shortcuts()
 
@@ -604,17 +660,6 @@ class MainWindow(QMainWindow):
         self.fov_center_combo.currentIndexChanged.connect(self._on_config_changed)
         infer_layout.addLayout(create_row("推理中心", self.fov_center_combo, "选择推理区域和锁定范围的参考点。'屏幕中心'适合大多数第一人称射击游戏，'鼠标位置'适合 MOBA 或其他需要鼠标精准控制的游戏。"))
 
-        # 启动模式
-        self.trigger_mode_combo = QComboBox()
-        self.trigger_mode_combo.addItems(["点击启动按钮后生效", "长按热键生效"])
-        self.trigger_mode_combo.currentIndexChanged.connect(self._on_config_changed)
-        infer_layout.addLayout(create_row("启动模式", self.trigger_mode_combo, "选择 '长按热键生效' 后，系统仅在按下指定键时才会锁定目标，松开即停止。"))
-
-        # 触发键
-        self.trigger_key_recorder = HotkeyRecorder(current_key="Shift")
-        self.trigger_key_recorder.key_changed.connect(self._on_config_changed)
-        infer_layout.addLayout(create_row("触发热键", self.trigger_key_recorder, "仅在'长按热键生效'模式下有效。点击配置后，直接按下按键进行录制。"))
-
         # 启停键
         self.toggle_key_recorder = HotkeyRecorder(current_key="F9")
         self.toggle_key_recorder.key_changed.connect(self._on_config_changed)
@@ -649,22 +694,22 @@ class MainWindow(QMainWindow):
 
         # 行为开关行
         behavior_checks = QHBoxLayout()
-        self.auto_lock_check = QCheckBox("自动锁定 (?)")
-        self.auto_lock_check.setToolTip("开启后，系统会自动选择离鼠标最近的目标。如果关闭，仅进行推理显示。")
+        self.auto_lock_check = QCheckBox("鼠标自动跟踪 (?)")
+        self.auto_lock_check.setToolTip("开启后，无需按键即可自动跟踪并锁定视野内的目标。\n关闭后，需按住侧键/热键才会触发跟踪锁定。")
         self.auto_lock_check.stateChanged.connect(self._on_config_changed)
-        
-        self.auto_move_check = QCheckBox("自动移动 (?)")
-        self.auto_move_check.setToolTip("开启后，鼠标会自动移动到目标中心。")
-        self.auto_move_check.stateChanged.connect(self._on_config_changed)
         
         self.human_curve_check = QCheckBox("模拟人类曲线 (?)")
         self.human_curve_check.setToolTip("开启后，鼠标将模拟人类随机曲线轨迹移动，更具欺骗性。")
         self.human_curve_check.stateChanged.connect(self._on_config_changed)
         
         behavior_checks.addWidget(self.auto_lock_check)
-        behavior_checks.addWidget(self.auto_move_check)
         behavior_checks.addWidget(self.human_curve_check)
         input_layout.addLayout(behavior_checks)
+
+        # 移动触发键
+        self.move_key_recorder = HotkeyRecorder(current_key="RButton")
+        self.move_key_recorder.key_changed.connect(self._on_config_changed)
+        input_layout.addLayout(create_row("移动触发键", self.move_key_recorder, "未开启自动跟踪时，需按住此键触发锁定。"))
 
         # 范围与偏移行 (User Request: Move offset to same row as fov, split equally)
         fov_offset_layout = QHBoxLayout()
@@ -736,10 +781,55 @@ class MainWindow(QMainWindow):
         speed_layout.addWidget(self.custom_random_spin)
         input_layout.addLayout(speed_layout)
 
-        # 锁定后执行
+        # 鼠标灵敏度
+        self.sensitivity_spin = QDoubleSpinBox()
+        self.sensitivity_spin.setRange(0.01, 10.0)
+        self.sensitivity_spin.setSingleStep(0.1)
+        self.sensitivity_spin.setValue(1.0)
+        self.sensitivity_spin.setDecimals(2)
+        self.sensitivity_spin.setToolTip("鼠标移动的灵敏度倍率。用于适配不同游戏的鼠标灵敏度设置。如果画面移动不足，请调大；如果移动过度，请调小。")
+        self.sensitivity_spin.valueChanged.connect(self._on_config_changed)
+        input_layout.addLayout(create_row("鼠标灵敏度", self.sensitivity_spin, "鼠标移动的灵敏度倍率。"))
+
+        # 移动后执行
         self.post_action_recorder = HotkeyRecorder(current_key="")
         self.post_action_recorder.key_changed.connect(self._on_config_changed)
-        input_layout.addLayout(create_row("锁定后执行", self.post_action_recorder, "锁定目标后自动执行的操作，例如自动开火。可以是鼠标键或组合键。"))
+        input_layout.addLayout(create_row("移动后执行", self.post_action_recorder, "鼠标移动到目标位置后自动执行的操作，例如自动开火。可以是鼠标键或组合键。"))
+
+        # 执行次数与间隔
+        post_action_params_layout = QHBoxLayout()
+        
+        # 左侧：执行次数
+        count_sub_layout = QHBoxLayout()
+        count_label = QLabel("执行次数 (?)")
+        count_label.setToolTip("移动到目标位置后，后置操作执行的次数。例如设置为 10 可实现自动连发。")
+        count_label.setFixedWidth(80)
+        self.post_action_count_spin = QSpinBox()
+        self.post_action_count_spin.setRange(1, 100)
+        self.post_action_count_spin.setValue(1)
+        self.post_action_count_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.post_action_count_spin.valueChanged.connect(self._on_config_changed)
+        count_sub_layout.addWidget(count_label)
+        count_sub_layout.addWidget(self.post_action_count_spin)
+        
+        # 右侧：执行间隔
+        interval_sub_layout = QHBoxLayout()
+        interval_label = QLabel("执行间隔 (?)")
+        interval_label.setToolTip("多次执行之间的间隔时间（毫秒）。")
+        interval_label.setFixedWidth(80)
+        interval_label.setStyleSheet("margin-left: 10px;")
+        self.post_action_interval_spin = QSpinBox()
+        self.post_action_interval_spin.setRange(1, 1000)
+        self.post_action_interval_spin.setValue(10)
+        self.post_action_interval_spin.setSuffix(" ms")
+        self.post_action_interval_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.post_action_interval_spin.valueChanged.connect(self._on_config_changed)
+        interval_sub_layout.addWidget(interval_label)
+        interval_sub_layout.addWidget(self.post_action_interval_spin)
+        
+        post_action_params_layout.addLayout(count_sub_layout)
+        post_action_params_layout.addLayout(interval_sub_layout)
+        input_layout.addLayout(post_action_params_layout)
 
 
         layout.addWidget(input_group)
@@ -860,6 +950,86 @@ class MainWindow(QMainWindow):
         self.extract_btn.clicked.connect(self._start_extraction)
         layout.addWidget(self.extract_btn)
 
+    def _init_game_tab(self):
+        layout = QVBoxLayout(self.game_tab)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(15)
+
+        title = QLabel("游戏中心")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
+        layout.addWidget(title)
+        
+        # 后坐力抑制配置组
+        recoil_group = QGroupBox("后坐力抑制 (Recoil Control)")
+        recoil_layout = QVBoxLayout(recoil_group)
+        recoil_layout.setSpacing(12)
+        recoil_layout.setContentsMargins(12, 20, 12, 12)
+
+        def create_row(label_text, widget, tooltip=None):
+            row = QHBoxLayout()
+            label = QLabel(label_text)
+            if tooltip:
+                label.setToolTip(tooltip)
+                widget.setToolTip(tooltip)
+            label.setFixedWidth(140)
+            row.addWidget(label)
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            row.addWidget(widget)
+            return row
+
+        # 1. 功能开关
+        self.recoil_check = QCheckBox("启用后坐力抑制 (?)")
+        self.recoil_check.setToolTip("当程序接管准星且正在开火时，自动注入向下补偿量以抵消武器后坐力。")
+        self.recoil_check.stateChanged.connect(self._on_config_changed)
+        recoil_layout.addWidget(self.recoil_check)
+
+        # 2. 抑制强度
+        self.recoil_strength_spin = QSpinBox()
+        self.recoil_strength_spin.setRange(0, 100)
+        self.recoil_strength_spin.setSuffix(" px/frame")
+        self.recoil_strength_spin.valueChanged.connect(self._on_config_changed)
+        recoil_layout.addLayout(create_row("抑制强度", self.recoil_strength_spin, "调整向下压枪的力度（像素/帧）。0 为无效果，100 为超强压枪（适用于高分辨率或极大后坐力）。"))
+
+        # 3. 随机抖动
+        self.recoil_jitter_spin = QDoubleSpinBox()
+        self.recoil_jitter_spin.setRange(0.0, 2.0)
+        self.recoil_jitter_spin.setSingleStep(0.1)
+        self.recoil_jitter_spin.setDecimals(1)
+        self.recoil_jitter_spin.valueChanged.connect(self._on_config_changed)
+        recoil_layout.addLayout(create_row("水平随机抖动", self.recoil_jitter_spin, "在压枪时注入少许水平方向的随机移动，使动作看起来更像人类玩家。"))
+
+        layout.addWidget(recoil_group)
+
+        # 运动补偿与预判配置组
+        motion_group = QGroupBox("运动增强 (Motion Enhancement)")
+        motion_layout = QVBoxLayout(motion_group)
+        motion_layout.setSpacing(12)
+        motion_layout.setContentsMargins(12, 20, 12, 12)
+
+        # 2. 移动补偿
+        self.move_comp_check = QCheckBox("启用我方移动补偿")
+        self.move_comp_check.setToolTip("检测 WASD 按键。当您在走动时，自动抵消准星因位移产生的视觉晃动。")
+        self.move_comp_check.stateChanged.connect(self._on_config_changed)
+        motion_layout.addWidget(self.move_comp_check)
+
+        self.move_comp_strength_spin = QDoubleSpinBox()
+        self.move_comp_strength_spin.setRange(0.0, 5.0)
+        self.move_comp_strength_spin.setSingleStep(0.1)
+        self.move_comp_strength_spin.setDecimals(1)
+        self.move_comp_strength_spin.valueChanged.connect(self._on_config_changed)
+        
+        strength_tooltip = (
+            "调整 WASD 移动时的反向补偿力度。\n"
+            "数值越大，补偿越强（光标移动越快）。\n"
+            "- 1.0: 弱补偿 (适合步枪点射)\n"
+            "- 2.0: 中等补偿 (默认，适合大多数情况)\n"
+            "- 3.0+: 强补偿 (适合近距离冲锋)"
+        )
+        motion_layout.addLayout(create_row("补偿强度 (推荐 1.0-3.0)", self.move_comp_strength_spin, strength_tooltip))
+
+        layout.addWidget(motion_group)
+        layout.addStretch()
+
     def _update_extract_ui(self):
         if self.extract_mode_combo.currentIndex() == 0:
             self.extract_val_label.setText("抽取张数:")
@@ -957,6 +1127,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", message)
 
     def _load_config_to_ui(self):
+        # 暂时设置加载标志，防止初始化 UI 时触发 _on_config_changed 导致配置被错误覆盖
+        self._loading_config = True
+        
         self.conf_spin.setValue(self.config.get("inference.conf_thres"))
         self.debug_check.setChecked(self.config.get("gui.show_debug"))
         self.overlay_check.setChecked(False) # 默认不开启，避免遮挡
@@ -964,15 +1137,11 @@ class MainWindow(QMainWindow):
         center_mode = self.config.get("inference.fov_center_mode", "screen")
         self.fov_center_combo.setCurrentText("屏幕中心" if center_mode == "screen" else "鼠标位置")
         
-        trigger_mode = self.config.get("input.trigger_mode", "manual")
-        self.trigger_mode_combo.setCurrentIndex(0 if trigger_mode == "manual" else 1)
-        
-        self.trigger_key_recorder.set_key(self.config.get("input.trigger_key", "Shift"))
         self.toggle_key_recorder.set_key(self.config.get("input.toggle_key", "F9"))
+        self.move_key_recorder.set_key(self.config.get("input.move_key", "RButton"))
 
         # 行为设置加载
         self.auto_lock_check.setChecked(self.config.get("input.auto_lock", True))
-        self.auto_move_check.setChecked(self.config.get("input.auto_move", True))
         self.fov_spin.setValue(self.config.get("input.fov", 500))
         
         move_speed = self.config.get("input.move_speed", "normal")
@@ -984,7 +1153,27 @@ class MainWindow(QMainWindow):
         self.custom_random_spin.setValue(self.config.get("input.custom_speed_random", 5))
         self.human_curve_check.setChecked(self.config.get("input.human_curve", False))
         self.offset_spin.setValue(self.config.get("input.offset_radius", 0))
+        self.sensitivity_spin.setValue(self.config.get("input.mouse_sensitivity", 1.0))
         self.post_action_recorder.set_key(self.config.get("input.post_action", ""))
+        self.post_action_count_spin.setValue(self.config.get("input.post_action_count", 1))
+        self.post_action_interval_spin.setValue(self.config.get("input.post_action_interval_ms", 10))
+
+        # 后坐力设置加载
+        self.recoil_check.setChecked(self.config.get("input.recoil_enabled", False))
+        # 强度直接 1:1 映射
+        raw_strength = self.config.get("input.recoil_strength", 2.0)
+        self.recoil_strength_spin.setValue(int(raw_strength))
+        self.recoil_jitter_spin.setValue(self.config.get("input.recoil_x_jitter", 0.5))
+
+        # 运动增强设置加载
+        self.move_comp_check.setChecked(self.config.get("input.move_comp_enabled", False))
+        self.move_comp_strength_spin.setValue(self.config.get("input.move_comp_strength", 1.0))
+
+        # 恢复加载标志
+        self._loading_config = False
+        
+        # 确保初始化时同步配置到 Controller
+        self._on_config_changed()
 
         # 启动全局热键轮询定时器
         self.toggle_timer = QTimer(self)
@@ -992,29 +1181,8 @@ class MainWindow(QMainWindow):
         self.toggle_timer.start(30) # 30ms 检测一次 (提高响应速度)
         self._last_toggle_state = False
 
-        self._update_ui_state_by_mode()
-
     def _check_global_toggle(self):
         """轮询全局启停快捷键"""
-        mode_idx = self.trigger_mode_combo.currentIndex()
-        
-        # 1. Hold 模式 (长按热键启动)
-        if mode_idx == 1:
-            key = self.trigger_key_recorder.get_key()
-            if not key: return
-            
-            is_pressed = is_hotkey_pressed(key)
-            
-            # 状态同步：按住时运行，松开时停止
-            if is_pressed:
-                if self.controller and not self.controller.running:
-                    self._start_clicked()
-            else:
-                if self.controller and self.controller.running:
-                    self._stop_clicked()
-            return
-
-        # 2. Manual 模式 (点击按钮启动)
         # 检查全局启停快捷键 (toggle_key)
         key = self.toggle_key_recorder.get_key()
         if not key:
@@ -1033,30 +1201,10 @@ class MainWindow(QMainWindow):
                 
         self._last_toggle_state = is_pressed
 
-    def _update_ui_state_by_mode(self):
-        """根据当前启动模式，更新 UI 控件的启用/禁用状态"""
-        mode_idx = self.trigger_mode_combo.currentIndex()
-        # 0: 点击启动按钮后生效 (Manual)
-        # 1: 长按热键生效 (Hold)
-        
-        if mode_idx == 0:
-            # Manual 模式: 禁用长按触发键，启用启停快捷键
-            self.trigger_key_recorder.setEnabled(False)
-            self.toggle_key_recorder.setEnabled(True)
-            # 按钮状态由 _update_status 接管，但这里先重置一下
-            self.start_btn.setEnabled(not (self.controller and self.controller.running))
-            self.stop_btn.setEnabled(self.controller and self.controller.running)
-            self.start_btn.setText("启动系统")
-        else:
-            # Hold 模式: 启用长按触发键，禁用启停快捷键
-            self.trigger_key_recorder.setEnabled(True)
-            self.toggle_key_recorder.setEnabled(False)
-            # 禁用启动/停止按钮 (由热键全权控制)
-            self.start_btn.setEnabled(False)
-            self.stop_btn.setEnabled(False)
-            self.start_btn.setText("请长按热键启动")
-
     def _on_config_changed(self):
+        if self._loading_config:
+            return
+            
         conf_val = self.conf_spin.value()
         debug_val = self.debug_check.isChecked()
         overlay_val = self.overlay_check.isChecked()
@@ -1064,13 +1212,12 @@ class MainWindow(QMainWindow):
         
         center_mode_val = "screen" if self.fov_center_combo.currentText() == "屏幕中心" else "mouse"
         
-        trigger_mode_val = "manual" if self.trigger_mode_combo.currentIndex() == 0 else "hold"
-        trigger_key_val = self.trigger_key_recorder.get_key()
+        trigger_mode_val = "manual"
         toggle_key_val = self.toggle_key_recorder.get_key()
+        move_key_val = self.move_key_recorder.get_key()
         
         # 行为设置获取
         auto_lock_val = self.auto_lock_check.isChecked()
-        auto_move_val = self.auto_move_check.isChecked()
         fov_val = self.fov_spin.value()
         
         speed_text = self.move_speed_combo.currentText()
@@ -1088,10 +1235,20 @@ class MainWindow(QMainWindow):
         
         human_curve_val = self.human_curve_check.isChecked()
         offset_val = self.offset_spin.value()
+        sensitivity_val = self.sensitivity_spin.value()
         post_action_val = self.post_action_recorder.get_key()
+        post_action_count_val = self.post_action_count_spin.value()
+        post_action_interval_ms_val = self.post_action_interval_spin.value()
 
-        # 更新 UI 状态
-        self._update_ui_state_by_mode()
+        # 后坐力设置获取
+        recoil_enabled_val = self.recoil_check.isChecked()
+        # 直接 1:1 映射 (0-10)
+        recoil_strength_val = float(self.recoil_strength_spin.value())
+        recoil_jitter_val = self.recoil_jitter_spin.value()
+
+        # 运动增强设置获取
+        move_comp_enabled_val = self.move_comp_check.isChecked()
+        move_comp_strength_val = self.move_comp_strength_spin.value()
 
         # 保存到配置
         self.config.set("inference.conf_thres", conf_val)
@@ -1099,18 +1256,29 @@ class MainWindow(QMainWindow):
         self.config.set("inference.use_fov_inference", fov_inf_val)
         self.config.set("inference.fov_center_mode", center_mode_val)
         self.config.set("input.trigger_mode", trigger_mode_val)
-        self.config.set("input.trigger_key", trigger_key_val)
         self.config.set("input.toggle_key", toggle_key_val)
+        self.config.set("input.move_key", move_key_val)
         
         self.config.set("input.auto_lock", auto_lock_val)
-        self.config.set("input.auto_move", auto_move_val)
         self.config.set("input.fov", fov_val)
         self.config.set("input.move_speed", move_speed_val)
         self.config.set("input.custom_speed_ms", custom_speed_val)
         self.config.set("input.custom_speed_random", custom_random_val)
         self.config.set("input.human_curve", human_curve_val)
         self.config.set("input.offset_radius", offset_val)
+        self.config.set("input.mouse_sensitivity", sensitivity_val)
         self.config.set("input.post_action", post_action_val)
+        self.config.set("input.post_action_count", post_action_count_val)
+        self.config.set("input.post_action_interval_ms", post_action_interval_ms_val)
+        
+        # 后坐力配置保存
+        self.config.set("input.recoil_enabled", recoil_enabled_val)
+        self.config.set("input.recoil_strength", recoil_strength_val)
+        self.config.set("input.recoil_x_jitter", recoil_jitter_val)
+        
+        # 运动增强配置保存
+        self.config.set("input.move_comp_enabled", move_comp_enabled_val)
+        self.config.set("input.move_comp_strength", move_comp_strength_val)
         
         # 同步到控制器
         if self.controller:
@@ -1122,19 +1290,29 @@ class MainWindow(QMainWindow):
             self.controller.show_debug = debug_val
             self.controller.use_fov_inference = fov_inf_val
             self.controller.fov_center_mode = center_mode_val
-            self.controller.trigger_mode = trigger_mode_val
-            self.controller.trigger_key = trigger_key_val
+            self.controller.move_key = move_key_val
             
             # 行为设置同步
             self.controller.auto_lock = auto_lock_val
-            self.controller.auto_move = auto_move_val
             self.controller.fov_size = fov_val
             self.controller.move_speed = move_speed_val
             self.controller.custom_speed_ms = custom_speed_val
             self.controller.custom_speed_random = custom_random_val
             self.controller.human_curve = human_curve_val
             self.controller.offset_radius = offset_val
+            self.controller.mouse_sensitivity = sensitivity_val
             self.controller.post_action = post_action_val
+            self.controller.post_action_count = post_action_count_val
+            self.controller.post_action_interval = post_action_interval_ms_val / 1000.0
+
+            # 后坐力同步
+            self.controller.recoil_enabled = recoil_enabled_val
+            self.controller.recoil_strength = recoil_strength_val
+            self.controller.recoil_x_jitter = recoil_jitter_val
+
+            # 运动增强同步
+            self.controller.move_comp_enabled = move_comp_enabled_val
+            self.controller.move_comp_strength = move_comp_strength_val
 
     def _update_status(self):
         if self.controller and self.controller.running:
@@ -1144,18 +1322,11 @@ class MainWindow(QMainWindow):
             self.status_indicator.setStyleSheet("color: #d83b01; font-size: 18px;")
             self.status_text.setText("系统已停止")
             
-        # 根据启动模式更新按钮状态
-        mode_idx = self.trigger_mode_combo.currentIndex()
-        if mode_idx == 1: # Hold mode
-             self.start_btn.setEnabled(False)
-             self.stop_btn.setEnabled(False)
-             self.start_btn.setText("请长按热键启动")
-        else:
-             # Manual mode
-             is_running = self.controller and self.controller.running
-             self.start_btn.setEnabled(not is_running)
-             self.stop_btn.setEnabled(is_running)
-             self.start_btn.setText("启动系统")
+        # 更新按钮状态
+        is_running = self.controller and self.controller.running
+        self.start_btn.setEnabled(not is_running)
+        self.stop_btn.setEnabled(is_running)
+        self.start_btn.setText("启动系统")
 
     def _process_preview(self):
         """处理预览窗口和Overlay更新"""
@@ -1208,28 +1379,29 @@ class MainWindow(QMainWindow):
 
                 # 更新预览窗口 (需要画框)
                 if self.preview_window:
-                    # 在 UI 线程绘制，避免修改原始 frame
-                    # 使用 frame.copy() 或者直接在 QImage 上操作
-                    # 这里为了方便，我们先在 frame 上画，但最好不要
                     import cv2
                     disp_frame = frame.copy()
                     
                     # 绘制 FOV
-                    cv2.circle(disp_frame, center, int(fov_size / 2), (255, 255, 255), 1)
+                    cv2.circle(disp_frame, (int(center[0]), int(center[1])), int(fov_size / 2), (255, 255, 255), 1)
                     
                     # 绘制结果
                     for (x1, y1, x2, y2, conf, cls) in results:
                         color = (0, 255, 0)
                         if target is not None and x1 == target[0] and y1 == target[1]:
                             color = (0, 0, 255)
+                        
                         cv2.rectangle(disp_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                    
+                    # 绘制 FPS
+                    fps = debug_data.get('fps', 0)
+                    cv2.putText(disp_frame, f"FPS: {fps}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                         
                     self.preview_window.update_frame(disp_frame)
 
                 # 更新 Overlay
                 if self.overlay_window:
-                    fps = debug_data.get('fps', 0)
-                    self.overlay_window.update_data(results, target, center, fov_size / 2, fps)
+                    self.overlay_window.update_data(results, target, center, fov_size / 2, debug_data.get('fps', 0))
         else:
             # 全部关闭
             if self.preview_window is not None:
@@ -1836,12 +2008,10 @@ class MainWindow(QMainWindow):
 
     def _start_clicked(self):
         # 强制同步关键配置，防止 UI 状态与控制器不同步
-        trigger_mode = "manual" if self.trigger_mode_combo.currentIndex() == 0 else "hold"
-        self.controller.trigger_mode = trigger_mode
-        self.controller.trigger_key = self.trigger_key_recorder.get_key()
+        self.controller.trigger_mode = "manual"
         
         # 打印调试信息
-        print(f"[UI] 启动系统: 模式={trigger_mode}, 触发键={self.controller.trigger_key}")
+        print(f"[UI] 启动系统: 模式=manual")
         
         show_debug = self.debug_check.isChecked()
         self.controller.start(show_debug=show_debug)
@@ -1877,6 +2047,60 @@ class MainWindow(QMainWindow):
         model_layout.addWidget(self.model_info_label)
         
         layout.addWidget(model_group)
+        
+        # 1.5 模型优化部分 (TensorRT)
+        opt_group = QGroupBox("模型优化 (TensorRT)")
+        opt_layout = QVBoxLayout(opt_group)
+        
+        opt_params = QHBoxLayout()
+        opt_params.addWidget(QLabel("导出尺寸 (imgsz):"))
+        self.opt_imgsz_combo = QComboBox()
+        self.opt_imgsz_combo.addItems(["320", "640", "960", "1280"])
+        self.opt_imgsz_combo.setCurrentText("640")
+        self.opt_imgsz_combo.setToolTip("建议与推理时的 FOV 匹配。640 是通用选择。")
+        opt_params.addWidget(self.opt_imgsz_combo)
+        
+        opt_params.addSpacing(20)
+        
+        self.opt_half_check = QCheckBox("FP16 半精度")
+        self.opt_half_check.setChecked(True)
+        self.opt_half_check.setToolTip("显著提升速度，精度几乎无损。")
+        opt_params.addWidget(self.opt_half_check)
+        
+        opt_params.addStretch()
+        
+        self.btn_export_trt = QPushButton("导出为 TensorRT 模型")
+        self.btn_export_trt.setFixedHeight(32)
+        self.btn_export_trt.setStyleSheet("background-color: #107c10; font-weight: bold;")
+        self.btn_export_trt.clicked.connect(self._start_export)
+        opt_params.addWidget(self.btn_export_trt)
+        
+        opt_layout.addLayout(opt_params)
+        
+        # 导出进度条
+        self.opt_progress = QProgressBar()
+        self.opt_progress.setVisible(False)
+        self.opt_progress.setTextVisible(True)
+        self.opt_progress.setAlignment(Qt.AlignCenter)
+        self.opt_progress.setFormat("正在转换: %p%")
+        self.opt_progress.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #444;
+                border-radius: 4px;
+                background-color: #444444;
+                text-align: center;
+                color: white;
+                height: 15px;
+                font-size: 10px;
+            }
+            QProgressBar::chunk {
+                background-color: #107c10;
+                border-radius: 2px;
+            }
+        """)
+        opt_layout.addWidget(self.opt_progress)
+        
+        layout.addWidget(opt_group)
 
         # 2. 模型训练部分
         train_group = QGroupBox("模型训练 (YOLOv8)")
@@ -2026,10 +2250,12 @@ class MainWindow(QMainWindow):
         self.model_combo.clear()
         root = get_root_path()
         
-        # 1. 添加内置模型 (项目根目录下的 .pt 文件，只显示文件名)
-        models = [f for f in os.listdir(root) if f.endswith(".pt")]
+        # 1. 添加内置模型 (项目根目录下的 .pt 和 .engine 文件，只显示文件名)
+        models = [f for f in os.listdir(root) if f.endswith(".pt") or f.endswith(".engine")]
         if not models:
             models = ["base.pt"]
+        # 排序：.pt 优先，然后按字母顺序
+        models.sort(key=lambda x: (not x.endswith(".pt"), x))
         self.model_combo.addItems(models)
         
         # 2. 处理当前配置的显示
@@ -2046,9 +2272,24 @@ class MainWindow(QMainWindow):
         
         self.model_combo.blockSignals(False)
         
+        # 手动触发一次按钮状态更新
+        self._update_export_button_state(current)
+        
         # 同步更新训练部分的基础模型显示 (统一只显示简名)
         if hasattr(self, 'train_base_model_label'):
             self.train_base_model_label.setText(f"当前训练基础权重: {os.path.basename(current)}")
+
+    def _update_export_button_state(self, model_path):
+        """根据模型格式更新导出按钮状态"""
+        if not hasattr(self, 'btn_export_trt'):
+            return
+            
+        is_engine = model_path.endswith(".engine")
+        self.btn_export_trt.setEnabled(not is_engine)
+        if is_engine:
+            self.btn_export_trt.setToolTip("当前已是 TensorRT 模型，无需优化")
+        else:
+            self.btn_export_trt.setToolTip("将当前模型转换为 TensorRT 格式以提升 FPS")
 
     def _on_model_selection_changed(self, model_name):
         if not model_name: return
@@ -2067,6 +2308,9 @@ class MainWindow(QMainWindow):
             
         self.config.set("inference.model_path", save_val)
         
+        # 更新按钮状态
+        self._update_export_button_state(full_path)
+
         # 同步更新训练部分的基础模型显示
         if hasattr(self, 'train_base_model_label'):
             self.train_base_model_label.setText(f"当前训练基础权重: {os.path.basename(full_path)}")
@@ -2079,7 +2323,7 @@ class MainWindow(QMainWindow):
                 self.status_text.setText(f"系统运行中 (模型已更新: {os.path.basename(full_path)})")
 
     def _browse_model(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择模型文件", get_root_path(), "YOLO Models (*.pt)")
+        path, _ = QFileDialog.getOpenFileName(self, "选择模型文件", get_root_path(), "YOLO Models (*.pt *.engine)")
         if path:
             root = get_root_path()
             name = os.path.basename(path)
@@ -2096,6 +2340,68 @@ class MainWindow(QMainWindow):
             
             # 切换到该项 (会触发 _on_model_selection_changed)
             self.model_combo.setCurrentIndex(idx)
+
+    def _start_export(self):
+        """开始 TensorRT 导出"""
+        model_path = self.config.get("inference.model_path", "base.pt")
+        if not os.path.isabs(model_path):
+            model_path = get_abs_path(model_path)
+            
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "错误", f"找不到模型文件: {model_path}")
+            return
+            
+        if model_path.endswith(".engine"):
+            QMessageBox.warning(self, "提示", "该模型已经是 TensorRT 格式 (.engine)，无需再次转换。")
+            return
+
+        # 确认对话框
+        reply = QMessageBox.question(self, "导出确认", 
+                                     f"确定要将 {os.path.basename(model_path)} 转换为 TensorRT 格式吗？\n\n"
+                                     "注意：\n"
+                                     "1. 导出过程需要 3-10 分钟，期间程序可能响应稍慢。\n"
+                                     "2. 转换完成后将生成同名的 .engine 文件。\n"
+                                     "3. 建议在导出期间不要进行其他大数据操作。",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        
+        if reply != QMessageBox.Yes:
+            return
+
+        # 界面状态更新
+        self.btn_export_trt.setEnabled(False)
+        self.opt_progress.setVisible(True)
+        self.opt_progress.setRange(0, 0) # 忙碌状态
+        self.train_log.appendPlainText(f"\n[{time.strftime('%H:%M:%S')}] --- 开始 TensorRT 转换任务 ---")
+
+        # 启动线程
+        imgsz = int(self.opt_imgsz_combo.currentText())
+        half = self.opt_half_check.isChecked()
+        
+        self.export_thread = ExportTRTThread(model_path, imgsz, half)
+        self.export_thread.log_signal.connect(self._on_export_log)
+        self.export_thread.finished.connect(self._on_export_finished)
+        self.export_thread.start()
+
+    def _on_export_log(self, message):
+        """处理导出日志"""
+        self.train_log.appendPlainText(f"[Export] {message}")
+        # 自动滚动到底部
+        self.train_log.verticalScrollBar().setValue(self.train_log.verticalScrollBar().maximum())
+
+    def _on_export_finished(self, success, message):
+        """导出完成处理"""
+        self.btn_export_trt.setEnabled(True)
+        self.opt_progress.setVisible(False)
+        self.opt_progress.setRange(0, 100)
+        
+        if success:
+            QMessageBox.information(self, "导出成功", message)
+            self.train_log.appendPlainText(f"[{time.strftime('%H:%M:%S')}] 导出任务成功完成。")
+            # 刷新模型列表，以便用户看到新的 .engine 文件（虽然推理引擎会自动检测，但刷新列表更直观）
+            self._refresh_model_list()
+        else:
+            QMessageBox.critical(self, "导出失败", message)
+            self.train_log.appendPlainText(f"[{time.strftime('%H:%M:%S')}] 导出任务失败。")
 
     def _browse_train_dataset(self):
         path = QFileDialog.getExistingDirectory(self, "选择整理后的数据集目录")

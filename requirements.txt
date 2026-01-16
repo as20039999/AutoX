@@ -18,3 +18,13 @@ pyautogui
 # 安全防护预研
 pyarmor==8.4.6
 nuitka==2.0
+
+# 模型优化 (TensorRT - 待手动安装)
+wheel
+cuda-python 
+onnx>=1.12.0 
+onnxslim 
+onnxruntime-gpu 
+tensorrt-cu12>=10.0
+tensorrt-cu12-bindings>=10.0
+tensorrt-cu12-libs>=10.0

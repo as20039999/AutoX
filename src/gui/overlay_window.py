@@ -70,10 +70,10 @@ class OverlayWindow(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         
         # 0. 绘制 FPS (左上角)
-        if self.fps > 0:
+        if 0 < self.fps < 10000: # 过滤异常极大的 FPS
             painter.setPen(QColor(0, 255, 0))
             painter.setFont(QFont("Arial", 12, QFont.Bold))
-            painter.drawText(10, 30, f"FPS: {self.fps}")
+            painter.drawText(10, 30, f"FPS: {int(self.fps)}")
 
         # 1. 绘制 FOV 圈 (白色虚线，半透明)
         if self.fov_radius > 0:

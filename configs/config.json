@@ -1,7 +1,7 @@
 {
     "inference": {
-        "model_path": "D:/Dev/Projects/AS/Yolo_train/train2/weights/best.pt",
-        "conf_thres": 0.68,
+        "model_path": "D:/Dev/Projects/AS/Yolo_train/cf/train1_result/weights/cf_best.engine",
+        "conf_thres": 0.8,
         "iou_thres": 0.45,
         "device": "cuda",
         "target_classes": [
@@ -11,20 +11,28 @@
         "fov_center_mode": "screen"
     },
     "input": {
-        "fov": 800.0,
-        "auto_lock": true,
-        "auto_move": false,
-        "move_speed": "fast",
-        "custom_speed_ms": 1,
-        "custom_speed_random": 0,
+        "fov": 700.0,
+        "auto_lock": false,
+        "move_speed": "fast_medium",
+        "custom_speed_ms": 10,
+        "custom_speed_random": 50,
         "human_curve": false,
         "offset_radius": 0,
+        "mouse_sensitivity": 1.1,
+        "move_key": "Alt",
         "post_action": "",
+        "post_action_count": 2,
+        "post_action_interval_ms": 20,
+        "recoil_enabled": true,
+        "recoil_strength": 10.0,
+        "auto_move": false,
         "sensitivity": 1.0,
         "smooth": 5,
-        "trigger_mode": "manual",
-        "trigger_key": "Ctrl",
-        "toggle_key": "Ctrl+X"
+        "toggle_key": "F1",
+        "recoil_x_jitter": 0.0,
+        "move_comp_enabled": true,
+        "move_comp_strength": 2.0,
+        "trigger_mode": "manual"
     },
     "gui": {
         "theme": "dark",

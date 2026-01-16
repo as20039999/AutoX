@@ -71,15 +71,29 @@ class DDACapture(AbstractCapture):
             output_color="BGR" # 直接输出 BGR 格式，省去转换耗时
         )
         if self.camera:
-            # 启动缓存循环，提高 FPS 平滑度
-            self.camera.start(target_fps=60, video_mode=True)
+            # 启动缓存循环
+            # target_fps 设为 0 表示不限制采集频率，尽力而为
+            # video_mode=True 对于高频采集很有帮助
+            self.camera.start(target_fps=0, video_mode=True)
             self.is_running = True
         else:
             raise RuntimeError("Failed to initialize DXCAM (DDA).")
 
     def stop(self):
         if self.camera:
-            self.camera.stop()
+            try:
+                # dxcam 在 stop 时会打印 "Screen Capture FPS: ... "，
+                # 有时会出现错误的巨大数值（如 320亿），这里屏蔽其输出
+                import os
+                import sys
+                from contextlib import redirect_stdout
+                
+                with open(os.devnull, 'w') as fnull:
+                    with redirect_stdout(fnull):
+                        self.camera.stop()
+            except Exception:
+                # 如果屏蔽失败，就直接 stop
+                self.camera.stop()
             self.camera = None
         self.is_running = False
 
