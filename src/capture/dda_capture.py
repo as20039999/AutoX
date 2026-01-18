@@ -1,6 +1,7 @@
 import numpy as np
 import mss
 import dxcam
+import ctypes
 from .base import AbstractCapture
 
 class MSSCapture(AbstractCapture):
@@ -51,6 +52,8 @@ class DDACapture(AbstractCapture):
         self.camera = None
         self.device_idx = device_idx
         self.output_idx = output_idx
+        self.cuda_interop = None
+        self.enable_gpu_capture = True # 标记 GPU 采集是否可用
 
     def start(self):
         # dxcam.create 会自动选择最佳配置
@@ -71,10 +74,9 @@ class DDACapture(AbstractCapture):
             output_color="BGR" # 直接输出 BGR 格式，省去转换耗时
         )
         if self.camera:
-            # 启动缓存循环
-            # target_fps 设为 60，以支持更高刷新率，确保推理模块获取最新帧
-            # video_mode=True 对于高频采集很有帮助
-            self.camera.start(target_fps=60, video_mode=True)
+            # 这里的 start/stop 是为了控制 dxcam 的生命周期，但不启动其内置线程
+            # 因为 AutoXController 已经有独立的采集线程
+            # 我们手动调用 grab 或 get_gpu_frame
             self.is_running = True
         else:
             raise RuntimeError("Failed to initialize DXCAM (DDA).")
@@ -82,19 +84,90 @@ class DDACapture(AbstractCapture):
     def stop(self):
         if self.camera:
             try:
-                # 显式停止采集循环
-                self.camera.stop()
+                # 释放资源
+                self.camera.release()
             except Exception as e:
                 print(f"[Capture] DXCAM stop error: {e}")
             finally:
-                # 销毁对象，释放显存/显存映射
                 del self.camera
                 self.camera = None
+        
+        # 清理 CUDA Interop 资源
+        self.cuda_interop = None
         self.is_running = False
 
     def get_frame(self) -> np.ndarray:
         if not self.is_running or not self.camera:
             return None
         
-        # get_latest_frame 获取最近的一帧
-        return self.camera.get_latest_frame()
+        # 手动采集模式：直接调用 grab
+        # 这会阻塞直到获取到新帧 (或者返回 None)
+        return self.camera.grab()
+
+    def get_gpu_frame(self):
+        """
+        获取 GPU 显存中的图像帧 (Torch Tensor)。
+        实现零拷贝 (Zero-Copy) 采集，直接用于 TensorRT 推理。
+        """
+        if not self.enable_gpu_capture or not self.is_running or not self.camera:
+            return None
+        
+        try:
+            # 获取内部 duplicator 对象
+            duplicator = self.camera._duplicator
+        except AttributeError:
+            return None
+
+        # 尝试更新帧
+        # 注意：如果 DDA 采集失败，update_frame 可能会抛出错误，需捕获
+        try:
+            if not duplicator.update_frame():
+                return None
+        except Exception as e:
+            # 这里的错误通常是临时的（如超时），不一定致命
+            # print(f"[Capture] DDA Update Error: {e}") 
+            return None
+            
+        if not duplicator.updated:
+            return None
+        
+        try:
+            # 延迟初始化 CUDA Interop
+            if self.cuda_interop is None:
+                # 使用绝对导入避免路径问题 (假设 src 在 sys.path 中)
+                try:
+                    from utils.cuda_interop import CUDAInterop
+                except ImportError:
+                    # 备用方案：如果 utils 不是顶级包
+                    from src.utils.cuda_interop import CUDAInterop
+                
+                # self.camera.width/height 是全屏分辨率
+                # self.camera.region 是截取区域 (left, top, right, bottom)
+                self.cuda_interop = CUDAInterop(
+                    self.camera.width, 
+                    self.camera.height, 
+                    self.camera.region
+                )
+                
+                # 获取 D3D11 纹理指针
+                # duplicator.texture 是 POINTER(ID3D11Texture2D)
+                texture_ptr = ctypes.cast(duplicator.texture, ctypes.c_void_p).value
+                self.cuda_interop.register_resource(texture_ptr)
+            
+            # 获取 Tensor (从 D3D11 纹理复制到 CUDA Buffer)
+            tensor = self.cuda_interop.get_tensor()
+            return tensor
+            
+        except Exception as e:
+            # 捕获严重错误 (如 Error 101 设备不匹配)
+            # 仅打印一次警告，并永久禁用 GPU 采集
+            print(f"[Capture] 🔴 GPU 采集初始化失败: {e}")
+            print("[Capture] ⚠️ 检测到跨显卡配置 (AMD采集/NVIDIA推理) 或驱动不兼容。")
+            print("[Capture] 🔄 已自动回退到 CPU 采集模式 (性能稍低但稳定)。")
+            self.enable_gpu_capture = False
+            return None
+        finally:
+            # 必须释放帧，否则 DDA 会阻塞
+            duplicator.release_frame()
+    
+        return None

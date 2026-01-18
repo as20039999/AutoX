@@ -193,7 +193,15 @@ class AutoXController:
             while not self.stop_event.is_set():
                 loop_start = time.perf_counter()
                 try:
-                    frame = self.capture.get_frame()
+                    # 尝试使用 GPU 零拷贝采集
+                    frame = None
+                    if hasattr(self.capture, 'get_gpu_frame'):
+                        frame = self.capture.get_gpu_frame()
+                    
+                    # 回退机制：如果 GPU 采集不可用或失败，尝试 CPU 采集
+                    if frame is None:
+                        frame = self.capture.get_frame()
+                    
                     capture_time = time.perf_counter()
                     if frame is not None:
                         # 如果队列满了，先取出旧帧，放入新帧
@@ -931,8 +939,16 @@ class AutoXController:
                             ))
 
                     if not self.debug_queue.full():
+                        # 如果是 Tensor (GPU)，需要转回 CPU Numpy 用于显示
+                        debug_frame = frame
+                        if hasattr(frame, 'is_cuda') and frame.is_cuda:
+                            try:
+                                debug_frame = frame.cpu().numpy()
+                            except Exception:
+                                pass # 转换失败则保持原样，由 UI 处理或忽略
+
                         debug_data = {
-                            "frame": frame, # 直接传递原始帧 (NumPy 数组)
+                            "frame": debug_frame, # 传递 NumPy 数组
                             "results": display_results,
                             "target": target,
                             "center": (center_x, center_y),

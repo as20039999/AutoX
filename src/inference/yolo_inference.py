@@ -129,6 +129,13 @@ class YOLOInference(AbstractInference):
         # 兼容单帧和多帧 (Batch)
         is_batch = isinstance(frame_or_frames, list)
         
+        # 检查是否为 GPU Tensor 输入
+        is_gpu_input = False
+        if is_batch and len(frame_or_frames) > 0 and isinstance(frame_or_frames[0], torch.Tensor):
+            is_gpu_input = True
+        elif isinstance(frame_or_frames, torch.Tensor):
+            is_gpu_input = True
+        
         # 增加异常捕获
         try:
             # 执行推理
@@ -139,23 +146,25 @@ class YOLOInference(AbstractInference):
             # [DEBUG] 打印推理前时间点
             # print(f"[Inf-Debug] Start Predict: {time.perf_counter():.4f}", flush=True)
             
-            # 强制同步 CUDA 流，确保之前的 GPU 操作（如 DDA 采集）已完成
-            # 这有助于避免资源冲突，虽然会轻微增加 CPU 等待时间
-            if self.device == 'cuda':
-                torch.cuda.synchronize()
+            # 优化：移除强制同步，改用异步流 (需上层保证数据准备完毕)
+            # if self.device == 'cuda':
+            #     torch.cuda.synchronize()
 
-            results = self.model.predict(
-                frame_or_frames, 
-                verbose=False, 
-                device=self.device,
-                iou=self.iou_thres,
-                conf=self.conf_thres,
-                half=False, # 强制使用 FP32，避免 TensorRT FP16 精度问题或崩溃
-                save=False,
-                project=self.project_root,
-                name=".",
-                exist_ok=True
-            )
+            if is_gpu_input:
+                results = self._predict_gpu(frame_or_frames)
+            else:
+                results = self.model.predict(
+                    frame_or_frames, 
+                    verbose=False, 
+                    device=self.device,
+                    iou=self.iou_thres,
+                    conf=self.conf_thres,
+                    half=False, # 强制使用 FP32，避免 TensorRT FP16 精度问题或崩溃
+                    save=False,
+                    project=self.project_root,
+                    name=".",
+                    exist_ok=True
+                )
             
             # [DEBUG] 打印推理后时间点
             # print(f"[Inf-Debug] End Predict: {time.perf_counter():.4f}", flush=True)
@@ -196,3 +205,87 @@ class YOLOInference(AbstractInference):
         if not is_batch:
             return parsed_results[0]
         return parsed_results
+
+    def _predict_gpu(self, frame_or_frames):
+        """专门处理 GPU Tensor 输入的推理流程"""
+        # 1. 预处理 (HWC uint8 -> BCHW float32 normalized & resized)
+        # 支持 Batch
+        if isinstance(frame_or_frames, list):
+            # Stack tensors
+            if not frame_or_frames: return []
+            input_tensor = torch.stack(frame_or_frames)
+        else:
+            input_tensor = frame_or_frames.unsqueeze(0)
+            
+        # 记录原始尺寸 (H, W)
+        orig_shape = input_tensor.shape[1:3]
+        
+        # 预处理
+        preprocessed_tensor, ratio_pad = self._preprocess_tensor_gpu(input_tensor)
+        
+        # 2. 推理
+        results = self.model.predict(
+            preprocessed_tensor, 
+            verbose=False, 
+            device=self.device,
+            iou=self.iou_thres,
+            conf=self.conf_thres,
+            half=False,
+            save=False,
+            project=self.project_root,
+            name=".",
+            exist_ok=True
+        )
+        
+        # 3. 后处理 (Box Rescaling)
+        # 手动将 resize/pad 后的坐标映射回原图
+        for res in results:
+             if res.boxes is not None:
+                 self._scale_boxes_gpu(res.boxes.data, ratio_pad, orig_shape)
+                 
+        return results
+
+    def _preprocess_tensor_gpu(self, batch_tensor):
+        # batch_tensor: (B, H, W, C) uint8
+        
+        target_size = self.engine_imgsz if self.is_engine else 640
+        B, H, W, C = batch_tensor.shape
+        
+        # Permute to BCHW
+        img = batch_tensor.permute(0, 3, 1, 2)
+        
+        # Float & Norm
+        img = img.float() / 255.0
+        
+        # Resize (LetterBox logic)
+        r = min(target_size / H, target_size / W)
+        new_unpad = (int(round(W * r)), int(round(H * r)))
+        dw, dh = target_size - new_unpad[0], target_size - new_unpad[1]
+        dw /= 2
+        dh /= 2
+        
+        if r != 1:
+            img = torch.nn.functional.interpolate(img, size=(new_unpad[1], new_unpad[0]), mode='bilinear', align_corners=False)
+            
+        # Pad
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        img = torch.nn.functional.pad(img, (left, right, top, bottom), value=0.447)
+        
+        return img, (r, (dw, dh))
+
+    def _scale_boxes_gpu(self, boxes, ratio_pad, orig_shape):
+        # boxes: (N, 6)
+        ratio, (dw, dh) = ratio_pad
+        H, W = orig_shape
+        
+        # Undo padding
+        boxes[:, [0, 2]] -= dw
+        boxes[:, [1, 3]] -= dh
+        
+        # Undo scaling
+        boxes[:, :4] /= ratio
+        
+        # Clip
+        boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, W)
+        boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, H)
