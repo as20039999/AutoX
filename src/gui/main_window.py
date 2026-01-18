@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
                              QCheckBox, QFrame, QSpacerItem, QSizePolicy,
                              QTabWidget, QFileDialog, QProgressBar, QComboBox,
                              QLineEdit, QMessageBox, QSpinBox, QListWidget, QInputDialog, QDialog,
-                             QAbstractSpinBox, QTextEdit, QPlainTextEdit, QSplitter, QMenu)
+                             QAbstractSpinBox, QTextEdit, QPlainTextEdit, QSplitter, QMenu, QApplication)
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QIcon, QAction, QKeySequence, QShortcut, QPixmap, QPainter, QColor, QImage
 
@@ -1280,22 +1280,19 @@ class MainWindow(QMainWindow):
         
         self._on_config_changed()
         
-        reply = QMessageBox.question(
+        QMessageBox.information(
             self, 
             "需重启生效", 
-            "输入驱动已切换，需要重启程序才能生效。\n是否立即重启？",
-            QMessageBox.Yes | QMessageBox.No, 
-            QMessageBox.Yes
+            "输入驱动已切换。程序即将关闭，请手动重新启动以应用更改。",
+            QMessageBox.Ok
         )
         
-        if reply == QMessageBox.Yes:
-            # 重启程序
-            # 停止可能运行的线程 (虽然 execl 会强制杀死，但优雅一点更好)
-            if hasattr(self, 'controller'):
-                self.controller.stop()
-            
-            python = sys.executable
-            os.execl(python, python, *sys.argv)
+        # 关闭程序
+        if hasattr(self, 'controller'):
+            self.controller.stop()
+        
+        # 使用 quit() 退出应用程序，触发 main.py 中的清理流程
+        QApplication.instance().quit()
 
     def _on_config_changed(self):
         if self._loading_config:
