@@ -60,6 +60,15 @@ class AutoXController:
             self.inference.model_path = path
             self.inference.load_model()
 
+    @property
+    def max_fps(self):
+        return self._max_fps
+
+    @max_fps.setter
+    def max_fps(self, value):
+        self._max_fps = value
+        self.target_fps = value # 同步更新采集频率
+
     def _set_high_priority(self):
         """(已禁用) 提升进程和线程优先级"""
         # 移除高优先级设置，防止系统驱动(如 DD)饥饿导致死锁
@@ -96,15 +105,13 @@ class AutoXController:
         self.screen_center = (self.input.screen_width // 2, self.input.screen_height // 2)
         
         # FPS 限制
-        self.max_fps = self.config.get("inference.max_fps", 60)
+        self._max_fps = self.config.get("inference.max_fps", 60)
+        self.target_fps = self._max_fps # 同步采集频率与推理频率
         self.last_frame_time = 0
         
         # 批处理配置
         self.batch_size = 1 # 默认批次大小 (开启批处理时动态增加)
         self.max_batch_size = 4 # 最大允许批次大小
-        
-        # FPS 限制
-        self.target_fps = 60
 
         # 4. 鼠标运动监控 (防抖与用户优先策略)
         # 阈值 30px, 冷却 50ms (0.05s)
@@ -221,11 +228,12 @@ class AutoXController:
                     elapsed = time.perf_counter() - loop_start
                     # 提高容忍度，只有当明显超过目标频率时才休眠
                     wait_time = (1.0 / self.target_fps) - elapsed
-                    if wait_time > 0.001: # 只有大于 1ms 才休眠
+                    if wait_time > 0.002: # 增加阈值，减少极短休眠
                         time.sleep(wait_time)
                     else:
                         # 即使不休眠，也给系统调度一点机会
-                        time.sleep(0.0001) 
+                        # 0.001 (1ms) 是 Windows 下较好的平衡点
+                        time.sleep(0.001) 
 
         finally:
             self.capture.stop()
@@ -284,8 +292,8 @@ class AutoXController:
                     pass
                 
                 # 短暂休眠，避免空转占用 CPU
-                # 调整休眠时间为 1ms，保持极高响应速度 (1000Hz)
-                time.sleep(0.001)
+                # 调整休眠时间为 2ms，降低 CPU 负载同时保持足够响应速度 (500Hz)
+                time.sleep(0.002)
                     
             except Exception as e:
                 print(f"[Core] 输入线程异常: {e}")
@@ -381,13 +389,8 @@ class AutoXController:
         last_log_time = time.time()
         while not self.stop_event.is_set():
             try:
-                # FPS 频率控制
-                if self.max_fps > 0:
-                    min_interval = 1.0 / self.max_fps
-                    elapsed = time.perf_counter() - self.last_frame_time
-                    if elapsed < min_interval:
-                        time.sleep(min_interval - elapsed)
-                self.last_frame_time = time.perf_counter()
+                # 核心实时性优化：移除推理端的频率限制（max_fps），由采集端（target_fps）统一控速。
+                # 推理端只需尽快消费队列中的最新帧，从而消除相位差带来的额外延迟。
 
                 # A. 获取图像与上下文
                 
@@ -395,36 +398,24 @@ class AutoXController:
                 self.mouse_monitor.update()
                 
                 try:
-                    # 动态批处理：尝试获取队列中所有可用的帧
-                    batch_items = []
+                    # 尽可能清空队列，只取最后一帧，保证实时性（跳过积压帧）
+                    # 阻塞获取第一帧，超时 100ms
+                    item = self.frame_queue.get(timeout=0.1)
+                    batch_items = [item]
                     
-                    # 首先阻塞获取第一帧
-                    # 减小超时时间，增加检查频率
-                    try:
-                        item = self.frame_queue.get(timeout=0.01)
-                        batch_items.append(item)
-                    except queue.Empty:
-                        continue # 没有帧，继续循环检查 stop_event
-                    
-                    # 如果还有剩余帧，且未达到最大批次，则继续非阻塞获取
-                    # 注意：对于固定 Batch=1 的 TensorRT 模型，多帧推理会变成顺序执行，增加延迟
-                    while not self.frame_queue.empty() and len(batch_items) < self.max_batch_size:
+                    # 丢弃积压的旧帧，只留最后一帧
+                    while not self.frame_queue.empty():
                         try:
-                            batch_items.append(self.frame_queue.get_nowait())
+                            batch_items = [self.frame_queue.get_nowait()]
                         except queue.Empty:
                             break
                     
-                    # 性能优化：如果模型不支持批处理，为了降低延迟，我们只保留最新的一帧，丢弃旧帧
-                    if self.batch_size == 1 and len(batch_items) > 1:
-                        batch_items = [batch_items[-1]]
+                    # 记录开始推理的时间点
+                    self.last_frame_time = time.perf_counter()
                     
                     # 解包 batch_items -> batch_frames
-                    batch_frames = [x[0] for x in batch_items]
-                    # 获取当前用于控制的帧的采集时间（最后一帧）
-                    current_frame_capture_time = batch_items[-1][1]
-                    
-                    # 我们只对批次中的最后一帧（最新帧）计算控制上下文
-                    frame = batch_frames[-1]
+                    # batch_items 存储格式为 (frame, capture_time)
+                    frame, current_frame_capture_time = batch_items[0]
                     h, w = frame.shape[:2]
                     
                     if self.fov_center_mode == "mouse":
@@ -454,23 +445,9 @@ class AutoXController:
                         inference_frame = frame[y1_crop:y2_crop, x1_crop:x2_crop]
                         offset_x, offset_y = x1_crop, y1_crop
 
-                    # 推理与控制
-                    if len(batch_frames) > 1:
-                        if self.use_fov_inference:
-                            # 批量裁剪
-                            batch_inference_frames = [f[y1_crop:y2_crop, x1_crop:x2_crop] for f in batch_frames]
-                        else:
-                            batch_inference_frames = batch_frames
-                        
-                        # 执行批推理
-                        batch_results = self.inference.predict(batch_inference_frames)
-                        # 我们只关心最后一帧的结果
-                        results = batch_results[-1]
-                        inf_batch = len(batch_inference_frames)
-                    else:
-                        # 单帧推理
-                        results = self.inference.predict(inference_frame)
-                        inf_batch = 1
+                    # 3. 执行推理 (始终单帧推理以保证最低延迟)
+                    results = self.inference.predict(inference_frame)
+                    inf_batch = 1
                     
                     # 更新帧计数用于 FPS 计算
                     self.frame_count += inf_batch

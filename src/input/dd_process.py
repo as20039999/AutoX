@@ -64,38 +64,49 @@ def dd_worker_process(cmd_queue, status_queue, dll_path):
 
     # 命令循环
     last_action_time = 0.0
-    # 优化：降低最小间隔，从 10ms (100Hz) 提升至 2ms (500Hz)
-    # 这样可以更及时地响应来自推理线程的微小位移指令，减少“阶梯感”和卡顿。
-    min_action_interval = 0.002
+    # 优化：最小间隔设为 3ms (约 333Hz)
+    # 既能保证视觉上的平滑，又能大幅减轻驱动子进程的轮询压力
+    min_action_interval = 0.003
 
     while True:
         try:
-            # 计算下一次事件的等待时间
-            timeout = None
             now = time.time()
             
-            # 如果刚执行完动作，强制休息到最小间隔，防止 DD 驱动过载
+            # 1. 频率保护：如果刚执行完动作，强制休息
             time_since_last = now - last_action_time
             if time_since_last < min_action_interval:
-                sleep_time = min_action_interval - time_since_last
-                time.sleep(sleep_time)
-                now = time.time() # 更新时间
+                time.sleep(min_action_interval - time_since_last)
+                now = time.time()
 
+            # 2. 计算阻塞等待时间
+            timeout = None
             if pending_events:
-                # 如果有待处理事件，timeout 设为距离最近事件的时间
-                next_event_time = pending_events[0][0]
-                timeout = max(0, next_event_time - now)
+                # 如果有待处理事件，等待直到最近的一个事件到期
+                timeout = max(0.0, pending_events[0][0] - now)
+                # 优化：如果 timeout 极小，直接处理而不进入 get()，避免频繁唤醒
+                if timeout < 0.001:
+                    timeout = 0
             
-            # 阻塞接收命令 (带超时)
+            # 3. 阻塞获取新命令
             got_command = False
+            cmd_data = None
+            
             try:
-                cmd_data = cmd_queue.get(timeout=timeout)
-                got_command = True
+                # 仅当没有到期事件需要立即处理时，才进行带超时的阻塞
+                if timeout is None:
+                    cmd_data = cmd_queue.get()
+                    got_command = True
+                elif timeout > 0:
+                    cmd_data = cmd_queue.get(timeout=timeout)
+                    got_command = True
+                else:
+                    # timeout 为 0，说明有事件到期，非阻塞尝试获取新命令
+                    cmd_data = cmd_queue.get_nowait()
+                    got_command = True
             except queue.Empty:
-                cmd_data = None
                 got_command = False
             
-            # 1. 处理新命令
+            # 4. 处理新命令
             if got_command:
                 if cmd_data is None: # 退出信号
                     break

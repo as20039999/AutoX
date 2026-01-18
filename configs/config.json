@@ -7,7 +7,7 @@
         "target_classes": [
             0
         ],
-        "max_fps": 60,
+        "max_fps": 30,
         "use_fov_inference": true,
         "fov_center_mode": "screen"
     },
@@ -25,7 +25,7 @@
         "custom_speed_random": 50,
         "human_curve": false,
         "offset_radius": 0,
-        "recoil_enabled": true,
+        "recoil_enabled": false,
         "recoil_strength": 20.0,
         "auto_move": false,
         "sensitivity": 1.0,
