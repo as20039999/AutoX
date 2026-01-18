@@ -39,3 +39,7 @@ class AbstractInput(ABC):
     def key_up(self, key_code: int):
         """抬起按键"""
         pass
+
+    def cleanup(self):
+        """资源清理 (可选)"""
+        pass

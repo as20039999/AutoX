@@ -55,17 +55,5 @@ class KalmanFilter:
 
         return self.x[:2]
 
-    def predict(self, steps=1):
-        """
-        预测未来几步的位置
-        """
-        if self.x is None:
-            return None
-        
-        x_pred = self.x
-        for _ in range(steps):
-            x_pred = self.A @ x_pred
-        return x_pred[:2]
-
     def reset(self):
         self.x = None

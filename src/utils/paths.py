@@ -17,3 +17,7 @@ def get_root_path():
 def get_abs_path(relative_path):
     """获取相对于根目录的绝对路径"""
     return os.path.join(get_root_path(), relative_path)
+
+def get_asset_path(relative_path):
+    """获取相对于 assets 目录的绝对路径"""
+    return os.path.join(get_root_path(), "assets", relative_path)

@@ -60,6 +60,12 @@ def non_max_suppression(
     assert 0 <= iou_thres <= 1, f"Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0"
     if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
         prediction = prediction[0]  # select only inference output
+
+    # [AutoX Fix] Force NMS on CPU to avoid CUDA driver hangs during concurrent DDA capture
+    # This prevents the "A. Inference" freeze when GPU is under load
+    if prediction.device.type != 'cpu':
+        prediction = prediction.cpu()
+
     if classes is not None:
         classes = torch.tensor(classes, device=prediction.device)
 

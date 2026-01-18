@@ -9,7 +9,6 @@ torchvision==0.24.1+cu128
 
 # 图像处理与采集
 numpy==1.26.4
-opencv-python==4.9.0.80
 pywin32==306
 mss==9.0.1
 dxcam

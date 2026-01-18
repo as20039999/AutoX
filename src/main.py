@@ -1,11 +1,11 @@
 import sys
 import os
 import time
+import multiprocessing
 
-# 必须在导入 PySide6 之前导入 torch 和 cv2，防止显卡驱动初始化冲突 (WinError 1114)
+# 必须在导入 PySide6 之前导入 torch，防止显卡驱动初始化冲突 (WinError 1114)
 try:
     import torch
-    import cv2
 except ImportError:
     pass
 
@@ -64,8 +64,25 @@ class AutoXApp:
         self.window.show()
         
         # 4. 进入 Qt 事件循环
-        return self.app.exec()
+        exit_code = self.app.exec()
+        
+        # 5. 强制退出（保障控制台完全返回）
+        # 在 Windows 上，复杂的 CUDA/多进程应用在常规退出时常因驱动资源未释放而挂起
+        # 显式杀死所有子进程并退出
+        print("[Main] 程序已关闭，正在清理系统残留...")
+        try:
+            import psutil
+            parent = psutil.Process(os.getpid())
+            for child in parent.children(recursive=True):
+                try: child.kill()
+                except: pass
+        except:
+            pass
+            
+        import os
+        os._exit(exit_code)
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     app_instance = AutoXApp()
     sys.exit(app_instance.run())

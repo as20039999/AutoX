@@ -784,7 +784,25 @@ class AutoBackend(nn.Module):
             s = self.bindings["images"].shape
             assert im.shape == s, f"input size {im.shape} {'>' if self.dynamic else 'not equal to'} max model size {s}"
             self.binding_addrs["images"] = int(im.data_ptr())
-            self.context.execute_v2(list(self.binding_addrs.values()))
+            # Fix: Use async execution to avoid inference thread hanging on Windows
+            # TensorRT 8.5+ uses execute_async_v2, older versions use enqueue_v2
+            binding_addrs = list(self.binding_addrs.values())
+            stream = torch.cuda.current_stream().cuda_stream
+            
+            # Fix: Try async execution first using try-except to handle potential hasattr issues or version discrepancies
+            try:
+                self.context.execute_async_v2(binding_addrs, stream_handle=stream)
+            except (AttributeError, TypeError):
+                try:
+                    self.context.enqueue_v2(binding_addrs, stream_handle=stream)
+                except (AttributeError, TypeError):
+                    # Fallback to sync execution (prone to freezing on Windows)
+                    # Log warning if we are forced to use sync mode
+                    if not hasattr(self, '_warned_sync_mode'):
+                        print(f"[AutoBackend] Warning: Async inference not available. Context type: {type(self.context)}. Methods: {[m for m in dir(self.context) if 'execute' in m or 'enqueue' in m]}")
+                        self._warned_sync_mode = True
+                    self.context.execute_v2(binding_addrs)
+                
             y = [self.bindings[x].data for x in sorted(self.output_names)]
 
         # CoreML

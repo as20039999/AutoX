@@ -40,7 +40,15 @@ class PreviewWindow(QDialog):
         self.resize(640, 480)
 
     def update_frame(self, frame):
-        """更新显示帧 (BGR 格式)"""
+        """兼容旧接口"""
+        self.update_frame_with_data(frame, None)
+
+    def update_frame_with_data(self, frame, draw_data):
+        """
+        更新显示帧并绘制调试信息
+        :param frame: BGR 图像 (numpy)
+        :param draw_data: 包含 fov_center, results 等信息的字典
+        """
         if frame is None:
             return
             
@@ -48,13 +56,56 @@ class PreviewWindow(QDialog):
             height, width, channel = frame.shape
             bytes_per_line = 3 * width
             
-            # 使用 BGR888 格式
+            # 1. 构造 QImage (零拷贝)
             q_img = QImage(frame.data, width, height, bytes_per_line, QImage.Format_BGR888)
+            
+            # 2. 转换为 QPixmap 准备绘图
             pixmap = QPixmap.fromImage(q_img)
             
-            # 等比例缩放以适应窗口
+            # 3. 如果有绘制数据，使用 QPainter 在 Pixmap 上绘制
+            if draw_data:
+                painter = QPainter(pixmap)
+                painter.setRenderHint(QPainter.Antialiasing)
+                
+                # A. 绘制 FOV
+                if 'fov_center' in draw_data and 'fov_radius' in draw_data:
+                    cx, cy = draw_data['fov_center']
+                    r = draw_data['fov_radius']
+                    # QColor(R, G, B)
+                    pen = QColor(255, 255, 255) # 白色
+                    painter.setPen(pen)
+                    painter.drawEllipse(int(cx - r), int(cy - r), int(r * 2), int(r * 2))
+                
+                # B. 绘制检测结果
+                if 'results' in draw_data:
+                    target = draw_data.get('target')
+                    for (x1, y1, x2, y2, conf, cls) in draw_data['results']:
+                        # 默认绿色
+                        color = QColor(0, 255, 0)
+                        # 如果是目标，红色
+                        if target is not None and x1 == target[0] and y1 == target[1]:
+                            color = QColor(255, 0, 0)
+                        
+                        painter.setPen(color)
+                        painter.drawRect(int(x1), int(y1), int(x2 - x1), int(y2 - y1))
+
+                # C. 绘制 FPS
+                if 'fps' in draw_data:
+                    fps = draw_data['fps']
+                    painter.setPen(QColor(0, 255, 0))
+                    # 设置大一点的字体
+                    font = painter.font()
+                    font.setPointSize(16)
+                    font.setBold(True)
+                    painter.setFont(font)
+                    painter.drawText(20, 40, f"FPS: {fps}")
+                
+                painter.end()
+
+            # 4. 缩放并显示
             scaled_pixmap = pixmap.scaled(self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.label.setPixmap(scaled_pixmap)
+            
         except Exception as e:
             print(f"Preview update error: {e}")
 
@@ -523,6 +574,9 @@ class MainWindow(QMainWindow):
         self.preview_timer.start(10)
 
     def _init_ui(self):
+        # 禁用菜单栏快捷键触发，防止 Alt 键卡住 GUI
+        self.setMenuBar(None) 
+        
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
@@ -654,6 +708,14 @@ class MainWindow(QMainWindow):
         self.conf_spin.valueChanged.connect(self._on_config_changed)
         infer_layout.addLayout(create_row("置信度阈值", self.conf_spin, "只有 AI 判定目标的概率高于此值时才会触发锁定。值越高识别越严苛，越低越容易误识别。"))
 
+        # FPS 限制
+        self.max_fps_spin = QSpinBox()
+        self.max_fps_spin.setRange(5, 60)
+        self.max_fps_spin.setSingleStep(5)
+        self.max_fps_spin.setSuffix(" FPS")
+        self.max_fps_spin.valueChanged.connect(self._on_config_changed)
+        infer_layout.addLayout(create_row("最高 FPS", self.max_fps_spin, "设置推理频率上限。最高 30 FPS，较低的 FPS 可以显著降低 CPU/GPU 负载，防止系统过热或游戏掉帧。"))
+
         # 推理中心
         self.fov_center_combo = QComboBox()
         self.fov_center_combo.addItems(["屏幕中心", "鼠标位置"])
@@ -691,6 +753,12 @@ class MainWindow(QMainWindow):
         input_layout = QVBoxLayout(input_group)
         input_layout.setSpacing(12)
         input_layout.setContentsMargins(12, 20, 12, 12)
+
+        # 输入驱动选择
+        self.input_method_combo = QComboBox()
+        self.input_method_combo.addItems(["DD Input (推荐)", "Win32 Input (兼容)"])
+        self.input_method_combo.currentIndexChanged.connect(self._on_input_method_changed)
+        input_layout.addLayout(create_row("输入驱动", self.input_method_combo, "选择输入驱动类型。切换后需要重启程序生效。"))
 
         # 行为开关行
         behavior_checks = QHBoxLayout()
@@ -819,8 +887,8 @@ class MainWindow(QMainWindow):
         interval_label.setFixedWidth(80)
         interval_label.setStyleSheet("margin-left: 10px;")
         self.post_action_interval_spin = QSpinBox()
-        self.post_action_interval_spin.setRange(1, 1000)
-        self.post_action_interval_spin.setValue(10)
+        self.post_action_interval_spin.setRange(20, 1000)
+        self.post_action_interval_spin.setValue(20)
         self.post_action_interval_spin.setSuffix(" ms")
         self.post_action_interval_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.post_action_interval_spin.valueChanged.connect(self._on_config_changed)
@@ -1131,6 +1199,7 @@ class MainWindow(QMainWindow):
         self._loading_config = True
         
         self.conf_spin.setValue(self.config.get("inference.conf_thres"))
+        self.max_fps_spin.setValue(self.config.get("inference.max_fps", 30))
         self.debug_check.setChecked(self.config.get("gui.show_debug"))
         self.overlay_check.setChecked(False) # 默认不开启，避免遮挡
         self.fov_inference_check.setChecked(self.config.get("inference.use_fov_inference", False))
@@ -1139,6 +1208,10 @@ class MainWindow(QMainWindow):
         
         self.toggle_key_recorder.set_key(self.config.get("input.toggle_key", "F9"))
         self.move_key_recorder.set_key(self.config.get("input.move_key", "RButton"))
+        
+        # 输入驱动加载
+        input_method = self.config.get("input.input_method", "dd")
+        self.input_method_combo.setCurrentIndex(0 if input_method == "dd" else 1)
 
         # 行为设置加载
         self.auto_lock_check.setChecked(self.config.get("input.auto_lock", True))
@@ -1201,11 +1274,35 @@ class MainWindow(QMainWindow):
                 
         self._last_toggle_state = is_pressed
 
+    def _on_input_method_changed(self, index):
+        if self._loading_config:
+            return
+        
+        self._on_config_changed()
+        
+        reply = QMessageBox.question(
+            self, 
+            "需重启生效", 
+            "输入驱动已切换，需要重启程序才能生效。\n是否立即重启？",
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.Yes:
+            # 重启程序
+            # 停止可能运行的线程 (虽然 execl 会强制杀死，但优雅一点更好)
+            if hasattr(self, 'controller'):
+                self.controller.stop()
+            
+            python = sys.executable
+            os.execl(python, python, *sys.argv)
+
     def _on_config_changed(self):
         if self._loading_config:
             return
             
         conf_val = self.conf_spin.value()
+        max_fps_val = self.max_fps_spin.value()
         debug_val = self.debug_check.isChecked()
         overlay_val = self.overlay_check.isChecked()
         fov_inf_val = self.fov_inference_check.isChecked()
@@ -1215,6 +1312,7 @@ class MainWindow(QMainWindow):
         trigger_mode_val = "manual"
         toggle_key_val = self.toggle_key_recorder.get_key()
         move_key_val = self.move_key_recorder.get_key()
+        input_method_val = "dd" if self.input_method_combo.currentIndex() == 0 else "win32"
         
         # 行为设置获取
         auto_lock_val = self.auto_lock_check.isChecked()
@@ -1252,12 +1350,14 @@ class MainWindow(QMainWindow):
 
         # 保存到配置
         self.config.set("inference.conf_thres", conf_val)
+        self.config.set("inference.max_fps", max_fps_val)
         self.config.set("gui.show_debug", debug_val)
         self.config.set("inference.use_fov_inference", fov_inf_val)
         self.config.set("inference.fov_center_mode", center_mode_val)
         self.config.set("input.trigger_mode", trigger_mode_val)
         self.config.set("input.toggle_key", toggle_key_val)
         self.config.set("input.move_key", move_key_val)
+        self.config.set("input.input_method", input_method_val)
         
         self.config.set("input.auto_lock", auto_lock_val)
         self.config.set("input.fov", fov_val)
@@ -1287,6 +1387,7 @@ class MainWindow(QMainWindow):
             else:
                 self.controller.conf_thres = conf_val
                 
+            self.controller.max_fps = max_fps_val
             self.controller.show_debug = debug_val
             self.controller.use_fov_inference = fov_inf_val
             self.controller.fov_center_mode = center_mode_val
@@ -1379,25 +1480,23 @@ class MainWindow(QMainWindow):
 
                 # 更新预览窗口 (需要画框)
                 if self.preview_window:
-                    import cv2
+                    # 使用 QPainter 在原始帧上绘图，替代 cv2
+                    # 此时的 frame 是纯净的 BGR numpy 数组
                     disp_frame = frame.copy()
                     
-                    # 绘制 FOV
-                    cv2.circle(disp_frame, (int(center[0]), int(center[1])), int(fov_size / 2), (255, 255, 255), 1)
+                    # 将 numpy 数组转为 QImage 方便 QPainter 操作 (或者传递原始数据给 PreviewWindow 处理)
+                    # 这里为了简化，我们先直接把数据传给 update_frame_with_data，在窗口内部绘制
                     
-                    # 绘制结果
-                    for (x1, y1, x2, y2, conf, cls) in results:
-                        color = (0, 255, 0)
-                        if target is not None and x1 == target[0] and y1 == target[1]:
-                            color = (0, 0, 255)
-                        
-                        cv2.rectangle(disp_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                    # 构造绘制数据
+                    draw_data = {
+                        'fov_center': center,
+                        'fov_radius': fov_size / 2,
+                        'results': results,
+                        'target': target,
+                        'fps': debug_data.get('fps', 0)
+                    }
                     
-                    # 绘制 FPS
-                    fps = debug_data.get('fps', 0)
-                    cv2.putText(disp_frame, f"FPS: {fps}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                        
-                    self.preview_window.update_frame(disp_frame)
+                    self.preview_window.update_frame_with_data(disp_frame, draw_data)
 
                 # 更新 Overlay
                 if self.overlay_window:

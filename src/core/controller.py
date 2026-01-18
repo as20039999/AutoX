@@ -1,7 +1,7 @@
 import threading
 import time
 import queue
-import cv2
+# import cv2 # 移除 opencv 依赖，防止被检测
 import torch
 import math
 import random
@@ -16,6 +16,8 @@ from inference import YOLOInference
 from input import create_input
 from utils.hotkey import is_hotkey_pressed
 from utils.kalman import KalmanFilter
+from utils.config import ConfigManager
+from core.mouse_monitor import MouseMonitor
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -32,11 +34,15 @@ class AutoXController:
         
         # 1. 初始化各子模块
         print("[Core] 正在初始化核心控制器...")
+        self.config = ConfigManager() # 加载配置
         self.capture = create_capture(method="dda")
         self._model_path = model_path
         self.device = device
         self.inference = YOLOInference(model_path=model_path, device=device)
-        self.input = create_input(method="win32")
+        
+        input_method = self.config.get("input.input_method", "dd")
+        print(f"[Core] Input Method: {input_method}")
+        self.input = create_input(method=input_method)
         
         # 初始化参数和状态
         self._init_params()
@@ -55,22 +61,29 @@ class AutoXController:
             self.inference.load_model()
 
     def _set_high_priority(self):
-        """提升进程和线程优先级，确保在游戏高负载下仍能获得时间片"""
-        try:
-            import os
-            import psutil
-            p = psutil.Process(os.getpid())
-            # 设置为高优先级 (不是实时，实时可能导致系统假死)
-            p.nice(psutil.HIGH_PRIORITY_CLASS)
-            print("[Core] 已将进程优先级提升至: HIGH")
-        except Exception as e:
-            print(f"[Core] 提升优先级失败: {e}")
+        """(已禁用) 提升进程和线程优先级"""
+        # 移除高优先级设置，防止系统驱动(如 DD)饥饿导致死锁
+        print("[Core] 进程优先级保持默认 (NORMAL)")
+        pass
+        # try:
+        #     import os
+        #     import psutil
+        #     p = psutil.Process(os.getpid())
+        #     # 设置为高优先级 (不是实时，实时可能导致系统假死)
+        #     p.nice(psutil.HIGH_PRIORITY_CLASS)
+        #     print("[Core] 已将进程优先级提升至: HIGH")
+        # except Exception as e:
+        #     print(f"[Core] 提升优先级失败: {e}")
 
     def _init_params(self):
         # 2. 线程间通信
         self.frame_queue = queue.Queue(maxsize=5)  # 采集 -> 推理 (增大以支持批处理)
         self.debug_queue = queue.Queue(maxsize=1)  # 推理 -> UI (仅用于调试)
         self.stop_event = threading.Event()
+        
+        # [已移除] 全局安全锁：强制推理和输入操作互斥
+        # 采用多进程 DD 驱动方案，天然隔离资源，无需锁
+        # self.safety_lock = threading.Lock()
         
         # 3. 状态与配置
         self.running = False
@@ -82,9 +95,20 @@ class AutoXController:
         self.fov_center_mode = "screen" # FOV 中心模式: "screen" 或 "mouse"
         self.screen_center = (self.input.screen_width // 2, self.input.screen_height // 2)
         
+        # FPS 限制
+        self.max_fps = self.config.get("inference.max_fps", 30)
+        self.last_frame_time = 0
+        
         # 批处理配置
         self.batch_size = 1 # 默认批次大小 (开启批处理时动态增加)
         self.max_batch_size = 4 # 最大允许批次大小
+        
+        # FPS 限制
+        self.target_fps = 30
+
+        # 4. 鼠标运动监控 (防抖与用户优先策略)
+        # 阈值 30px, 冷却 50ms (0.05s)
+        self.mouse_monitor = MouseMonitor(threshold=30, timeout=0.05)
         
         # 进阶控制算法
         self.kf = KalmanFilter()
@@ -101,22 +125,18 @@ class AutoXController:
         self.pid_kd = 0.08
         self.last_target_center = None
         self.last_target_box = None
-        self.last_target_id = None      # 锁定目标的唯一性标识(基于坐标/IoU)
         self.locked_conf = 0.0
-        self.locked_bad_frames = 0
-        self.max_locked_bad_frames = 3
         self.on_target_frames = 0
         self.on_target_required = 1     # 降低门槛，追求“狠”
         self.fire_min_interval = 0.12   # 缩短开火间隔
-        self.last_fire_time = 0.0
-        self.shots_in_burst = 0
-        self.burst_reset_interval = 0.5
-        self.auto_fire_extra_interval = 0.01
+        self.last_fire_time = 0
         self.prev_raw_error_y = 0.0
         self.target_lost_frames = 0
         self.max_target_lost_frames = 10 # 预测保持时间 (短)
         self.lock_stick_frames = 120     # 锁定吸附时间 (长, 约2秒)，在此期间不切目标
         self.lock_retain_radius = 150   # 进一步扩大锁定保留范围，增强粘滞性
+        self.switch_delay_frames = 0    # 目标切换防抖计数器
+        self.switch_threshold = 5       # 目标切换防抖阈值 (帧)，约 80-100ms
         self.error_sum_x = 0
         self.error_sum_y = 0
         self.last_error_x = 0
@@ -128,28 +148,27 @@ class AutoXController:
         self.recoil_enabled = False
         self.recoil_strength = 2.0      # 每帧向下补偿的像素基础值
         self.recoil_x_jitter = 0.5      # 随机左右抖动补偿
-        self.recoil_start_time = 0.0
 
         # 运动补偿
         self.move_comp_enabled = False
         self.move_comp_strength = 1.0   # 移动补偿强度
-        self.last_target_pos_time = 0.0
-        self.target_velocity_x = 0.0
-        self.target_velocity_y = 0.0
 
         # 行为设置
         self.auto_lock = True
         self.move_key = "RButton" # 默认移动触发键 (右键)
-        self.move_speed = "normal"
-        self.custom_speed_ms = 10
-        self.custom_speed_random = 5
-        self.human_curve = False
-        self.offset_radius = 0
         self.mouse_sensitivity = 1.0    # 鼠标灵敏度倍率
         self.aim_offset_y = 0.3         # 瞄准点纵向偏移 (0.5 为中心, 0.2 为偏向头部)
         self.post_action = ""
         self.post_action_count = 1     # 后置操作执行次数
         self.post_action_interval = 0.01 # 后置操作执行间隔 (秒)
+
+        # 共享指令变量 (用于线程间通信)
+        # 1. 鼠标移动 (覆盖式，只保留最新)
+        self.latest_move_cmd = None
+        self.move_cmd_lock = threading.Lock()
+        
+        # 2. 按键动作 (队列式，保证不漏)
+        self.action_queue = queue.Queue(maxsize=10)
 
         # 系统状态监控 (每 10s 打印一次)
         self.last_report_time = time.perf_counter()
@@ -168,10 +187,11 @@ class AutoXController:
 
     def _capture_loop(self):
         """图像采集线程：尽力而为的高频采集"""
-        print("[Core] 采集线程已启动")
+        print(f"[Core] 采集线程已启动 (Target FPS: {self.target_fps})")
         self.capture.start()
         try:
             while not self.stop_event.is_set():
+                loop_start = time.perf_counter()
                 try:
                     frame = self.capture.get_frame()
                     capture_time = time.perf_counter()
@@ -186,65 +206,192 @@ class AutoXController:
                 except Exception as e:
                     print(f"[Core] 采集异常: {e}")
                     time.sleep(0.01)
+                
+                # FPS 限制
+                if self.target_fps > 0:
+                    elapsed = time.perf_counter() - loop_start
+                    wait_time = (1.0 / self.target_fps) - elapsed
+                    if wait_time > 0:
+                        time.sleep(wait_time)
+
         finally:
             self.capture.stop()
             print("[Core] 采集线程已停止")
 
+    def _input_loop(self):
+        """输入控制线程：独立处理鼠标移动和按键，避免阻塞推理线程"""
+        print(f"[Core] 输入线程已启动 (Thread: {threading.current_thread().name})")
+        
+        # --- 关键修改：在输入线程内部初始化 DD 驱动 ---
+        # 确保 DD_btn(0) 和 DD_movR 在同一个线程执行，避免跨线程调用导致的死锁
+        try:
+            if hasattr(self.input, 'init_driver'):
+                print("[Core] 正在输入线程中初始化 DD 驱动...")
+                self.input.init_driver()
+        except Exception as e:
+            print(f"[Core] 🔴 DD 驱动线程内初始化失败: {e}")
+
+        last_move_time = 0.0
+        # 优化：降低指令间隔限制。
+        # 此前 0.030 (33Hz) 限制过死导致卡顿。
+        # 现在设为 0.002 (500Hz)，实际频率受限于推理速度和 DD 子进程的内部限制。
+        min_interval = 0.002
+        
+        while not self.stop_event.is_set():
+            try:
+                # --- 1. 处理鼠标移动 (优先级高，需流畅) ---
+                cmd = None
+                with self.move_cmd_lock:
+                    if self.latest_move_cmd:
+                        cmd = self.latest_move_cmd
+                        self.latest_move_cmd = None
+                
+                if cmd:
+                    timestamp, dx, dy = cmd
+                    now = time.perf_counter()
+                    
+                    if now - timestamp < 0.2:
+                        if now - last_move_time >= min_interval:
+                            # 增加异常捕获，防止驱动底层错误导致线程静默退出
+                            try:
+                                self.input.move_rel(dx, dy)
+                            except Exception as e:
+                                print(f"[Core] Move failed: {e}")
+                            last_move_time = now
+                        else:
+                            # 频率限制，丢弃微小移动
+                            pass
+                
+                # --- 2. 处理按键动作 (优先级次之) ---
+                try:
+                    # 非阻塞获取动作
+                    action_item = self.action_queue.get_nowait()
+                    self._perform_action(action_item)
+                except queue.Empty:
+                    pass
+                
+                # 短暂休眠，避免空转占用 CPU
+                # 调整休眠时间为 1ms，保持极高响应速度 (1000Hz)
+                time.sleep(0.001)
+                    
+            except Exception as e:
+                print(f"[Core] 输入线程异常: {e}")
+                time.sleep(0.01)
+        print("[Core] 输入线程已停止")
+
+    def _perform_action(self, action_data):
+        """在输入线程中实际执行按键操作"""
+        try:
+            action_type = action_data.get('type')
+            
+            if action_type == 'click':
+                btn = action_data.get('button')
+                self.input.click(btn)
+                
+            elif action_type == 'key_sequence':
+                keys = action_data.get('keys', [])
+                interval = action_data.get('interval', 0.03)
+                
+                # 导入映射表
+                from utils.hotkey import KEY_MAP
+                vk_codes = []
+                
+                # 按下
+                for k in keys:
+                    vk = KEY_MAP.get(k)
+                    if vk:
+                        self.input.key_down(vk)
+                        vk_codes.append(vk)
+                
+                time.sleep(interval)
+                
+                # 抬起 (反向)
+                for vk in reversed(vk_codes):
+                    self.input.key_up(vk)
+                    
+        except Exception as e:
+            print(f"[Core] 执行按键动作失败: {e}")
+
     def _execute_post_action(self):
-        """执行锁定后的后置操作"""
+        """将后置操作放入队列，由输入线程执行"""
         if not self.post_action:
             return
             
         try:
-            import pyautogui
-            import time
-            
+            # 如果队列已满，说明输入线程处理不过来，丢弃本次开火以防积压
+            if self.action_queue.full():
+                return
+
             for _ in range(max(1, self.post_action_count)):
-                # 这里简单支持键盘按键和组合键，以及鼠标按键
-                # pyautogui.press 支持 "ctrl", "shift", "a", "b", "f1" 等
-                # 如果是组合键，可以用 "+" 分割，如 "ctrl+a"
-                if "+" in self.post_action:
-                    keys = self.post_action.split("+")
-                    pyautogui.hotkey(*keys)
-                elif self.post_action.lower() in ["lbutton", "left"]:
-                    pyautogui.click(button='left')
-                elif self.post_action.lower() in ["rbutton", "right"]:
-                    pyautogui.click(button='right')
-                elif self.post_action.lower() in ["mbutton", "middle"]:
-                    pyautogui.click(button='middle')
-                else:
-                    pyautogui.press(self.post_action)
+                action_lower = self.post_action.lower()
                 
-                # 如果次数大于1，且有间隔，则等待
-                if self.post_action_count > 1 and self.post_action_interval > 0:
-                    time.sleep(self.post_action_interval)
+                try:
+                    if action_lower in ["lbutton", "left"]:
+                        self.action_queue.put_nowait({'type': 'click', 'button': 'left'})
+                    elif action_lower in ["rbutton", "right"]:
+                        self.action_queue.put_nowait({'type': 'click', 'button': 'right'})
+                    elif action_lower in ["mbutton", "middle"]:
+                        self.action_queue.put_nowait({'type': 'click', 'button': 'middle'})
+                    else:
+                        # 键盘按键处理
+                        keys = self.post_action.split("+") if "+" in self.post_action else [self.post_action]
+                        cleaned_keys = []
+                        for k in keys:
+                            k = k.strip()
+                            if k.lower() == "ctrl": k = "Ctrl"
+                            elif k.lower() == "alt": k = "Alt"
+                            elif k.lower() == "shift": k = "Shift"
+                            elif len(k) == 1: k = k.upper()
+                            cleaned_keys.append(k)
+                            
+                        self.action_queue.put_nowait({
+                            'type': 'key_sequence', 
+                            'keys': cleaned_keys,
+                            'interval': random.uniform(0.02, 0.04)
+                        })
+                except queue.Full:
+                    pass # 队列满则丢弃
+                
+                
+                # 如果有多次操作，这里不再 sleep，而是让输入线程去处理
+                # 但为了逻辑简单，我们只发一次，或者循环发多次
+                # 注意：这里发多次会瞬间填满队列
+                
         except Exception as e:
-            print(f"[Core] 执行后置操作失败 ({self.post_action}): {e}")
+            print(f"[Core] 提交后置操作失败 ({self.post_action}): {e}")
 
     def _inference_loop(self):
         """推理与控制线程：消费图像并执行动作"""
         print("[Core] 推理线程已启动")
         prev_time = time.time()
         
-        # 速度映射表
-        SPEED_MAP = {
-            "fast": 0.01,
-            "fast_medium": 0.03,
-            "normal": 0.02,
-            "slow": 0.1,
-            "custom": 0.05 # 默认为 normal，后续会被 custom_speed_ms 覆盖
-        }
-
+        last_log_time = time.time()
         while not self.stop_event.is_set():
             try:
+                # FPS 频率控制
+                if self.max_fps > 0:
+                    min_interval = 1.0 / self.max_fps
+                    elapsed = time.perf_counter() - self.last_frame_time
+                    if elapsed < min_interval:
+                        time.sleep(min_interval - elapsed)
+                self.last_frame_time = time.perf_counter()
+
                 # A. 获取图像与上下文
+                
+                # 更新鼠标监控状态
+                self.mouse_monitor.update()
+                
                 try:
                     # 动态批处理：尝试获取队列中所有可用的帧
                     batch_items = []
                     
                     # 首先阻塞获取第一帧
-                    item = self.frame_queue.get(timeout=0.1)
-                    batch_items.append(item)
+                    # 减小超时时间，增加检查频率
+                    try:
+                        item = self.frame_queue.get(timeout=0.01)
+                        batch_items.append(item)
+                    except queue.Empty:
+                        continue # 没有帧，继续循环检查 stop_event
                     
                     # 如果还有剩余帧，且未达到最大批次，则继续非阻塞获取
                     # 注意：对于固定 Batch=1 的 TensorRT 模型，多帧推理会变成顺序执行，增加延迟
@@ -321,6 +468,10 @@ class AutoXController:
                     self.total_inf_latency += inf_latency_ms
                     self.inf_count += 1
 
+                    # 检查是否卡顿超过 100ms
+                    if inf_latency_ms > 100:
+                         print(f"[Core] Warning: High Latency Detected! Inf-Lat: {inf_latency_ms:.1f}ms (Possible Freeze)", flush=True)
+
                     # 每 10 秒打印一次系统资源报告
                     curr_time = now
                     if curr_time - self.last_report_time >= 10.0:
@@ -334,30 +485,16 @@ class AutoXController:
                         cpu_usage = psutil.cpu_percent()
                         mem_info = psutil.virtual_memory()
                         
-                        # 获取 GPU 真实利用率和显存占用 (通过 nvidia-smi)
-                        gpu_util = 0.0
+                        # 获取 GPU 显存占用 (仅使用 torch 避免 subprocess 阻塞)
                         gpu_mem_used = 0.0
                         try:
-                            # query-gpu: utilization.gpu (%), memory.used (MiB)
-                            output = subprocess.check_output(
-                                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
-                                encoding='utf-8',
-                                stderr=subprocess.DEVNULL
-                            ).strip()
-                            parts = output.split(',')
-                            if len(parts) >= 2:
-                                gpu_util = float(parts[0])
-                                gpu_mem_used = float(parts[1])
-                        except Exception:
-                            # 降级方案：如果 nvidia-smi 失败，使用 torch 尝试
-                            try:
-                                gpu_util = torch.cuda.utilization()
-                                free_mem, total_mem = torch.cuda.mem_get_info()
-                                gpu_mem_used = (total_mem - free_mem) / 1024**2
-                            except:
-                                pass
+                            # free_mem, total_mem = torch.cuda.mem_get_info()
+                            # gpu_mem_used = (total_mem - free_mem) / 1024**2
+                            pass # 暂时禁用 GPU 信息查询以避免阻塞
+                        except:
+                            pass
 
-                        print(f"[System] FPS: {fps:.1f} | Inf-Lat: {avg_inf:.1f}ms | Lock-Lat: {avg_lock:.1f}ms | Cap-Target: {avg_cap_lock:.1f}ms | CPU: {cpu_usage}% | GPU-Load: {gpu_util}% | MEM: {mem_info.percent}% | GPU-MEM: {gpu_mem_used:.0f}MB")
+                        print(f"[System] FPS: {fps:.1f} | Inf-Lat: {avg_inf:.1f}ms | Lock-Lat: {avg_lock:.1f}ms | Cap-Target: {avg_cap_lock:.1f}ms | CPU: {cpu_usage}% | MEM: {mem_info.percent}%", flush=True)
                         
                         self.frame_count = 0
                         self.total_inf_latency = 0.0
@@ -505,33 +642,58 @@ class AutoXController:
                             best_new_box = candidates[0][2]
 
                         # C. 最终决策
-                        # 逻辑变更：只要处于跟踪状态，始终优先锁定“粘滞目标”（稳）
-                        # 强吸附策略：一旦锁定目标，除非目标彻底丢失超过吸附时间，否则不切换目标
+                        # 逻辑变更：引入目标切换防抖 (Switch Delay)
+                        # 1. 如果找到了粘滞目标 (T1)，立即锁定，重置切换计数器
                         if sticky_res is not None:
                             target = sticky_res
                             self.last_target_box = sticky_box
+                            self.switch_delay_frames = 0
                         else:
-                            # 没找到粘滞目标
-                            # 如果当前处于“吸附期”（虽然没找到目标，但还没超时），强制不切新目标
-                            if self.last_target_box is not None and self.target_lost_frames < self.lock_stick_frames:
-                                target = None
+                            # 2. 没找到粘滞目标 (T1 丢失)
+                            # 检查是否应该切换到新目标 (T2)
+                            should_switch = False
+                            
+                            # 只有在有新目标的情况下，才进行切换判定
+                            if best_new_res is not None:
+                                self.switch_delay_frames += 1
+                                # 如果新目标持续存在超过阈值 (如 5 帧)，才允许切换
+                                if self.switch_delay_frames > self.switch_threshold:
+                                    should_switch = True
                             else:
-                                # 彻底没目标了，或者之前没锁过，才允许锁新目标
+                                # 连新目标都没有，重置切换计数
+                                self.switch_delay_frames = 0
+                            
+                            if should_switch:
+                                # 允许切换
                                 target = best_new_res
                                 if target is not None:
                                     self.last_target_box = best_new_box
+                                    # 注意：切换目标后，target_lost_frames 会在循环末尾自动重置为 0
+                                    self.switch_delay_frames = 0
+                            else:
+                                # 不允许切换，保持吸附 (等待 T1 重现)
+                                # 除非超时 (lock_stick_frames)，否则 target 为 None (不瞄准)
+                                if self.last_target_box is not None and self.target_lost_frames < self.lock_stick_frames:
+                                    target = None
+                                else:
+                                    # 超时了，彻底放弃 T1，允许立即切换到 T2 (如果有)
+                                    target = best_new_res
+                                    if target is not None:
+                                        self.last_target_box = best_new_box
+                                        self.switch_delay_frames = 0
                         
                     else:
                         # 没有候选目标，清除记忆 (或进入丢失倒计时)
-                        # 只有在持续按住热键且允许短时丢失时才保留
                         # 但为了简化逻辑，如果候选框都没了，就重置
                         target = None
                         self.last_target_box = None
+                        self.switch_delay_frames = 0
 
                 else:
                     # 如果未处于跟踪状态，强制清除目标锁定状态
                     target = None
                     self.last_target_box = None
+                    self.switch_delay_frames = 0
                     self.kf.reset()
                 
                 if target is not None:
@@ -598,6 +760,12 @@ class AutoXController:
                 # 只要目标存在（意味着已在跟踪状态）且全局触发开启，就执行接管
                 # is_tracking = self.auto_lock or move_triggered
                 is_program_controlling = target is not None and is_triggered and is_tracking
+                
+                # 用户优先策略：如果检测到用户正在移动鼠标，暂时让出控制权
+                if is_program_controlling and self.mouse_monitor.is_user_active():
+                    is_program_controlling = False
+                    # 重置 PID 误差，防止恢复控制时发生剧烈跳变
+                    self.last_error_x, self.last_error_y = 0.0, 0.0
                 
                 # 检测是否正在开火 (手动按住左键，或程序正在自动开火且处于连发状态)
                 now = time.time()
@@ -696,9 +864,11 @@ class AutoXController:
                     total_dx, total_dy = 0.0, 0.0
                 
                 # 再次限制移动增量的物理极限，防止单帧移动过大触发 OverflowError 或导致视角飞掉
-                # 设定单帧最大移动 1000 像素
-                total_dx = max(-1000.0, min(1000.0, total_dx))
-                total_dy = max(-1000.0, min(1000.0, total_dy))
+                # DD 驱动或游戏输入协议可能限制单次移动为 8-bit ([-127, 127])，超过会导致反向移动 (Overflow)
+                # 因此将单帧最大移动限制在安全范围 (例如 100)
+                limit = 100.0
+                total_dx = max(-limit, min(limit, total_dx))
+                total_dy = max(-limit, min(limit, total_dy))
 
                 step_x = int(total_dx)
                 step_y = int(total_dy)
@@ -707,31 +877,33 @@ class AutoXController:
                 self.remainder_y = total_dy - step_y
                 
                 if step_x != 0 or step_y != 0:
-                    self.input.move_rel(step_x, step_y)
+                    # 将移动指令发送到输入线程
+                    # 频率限制由输入线程负责，这里只负责发送最新指令
+                    # 使用非阻塞锁获取，避免影响推理速度
+                    if self.move_cmd_lock.acquire(blocking=False):
+                        try:
+                            self.latest_move_cmd = (time.perf_counter(), step_x, step_y)
+                            # 关键：向监视器报告程序指令，以抵消余额，防止误判为用户移动
+                            self.mouse_monitor.report_command(step_x, step_y)
+                        finally:
+                            self.move_cmd_lock.release()
+                    else:
+                        # 如果锁被占用（极少情况，因为输入线程持有锁的时间很短），
+                        # 选择跳过本次更新，而不是阻塞等待
+                        pass
 
                 # 4. 自动开火触发 (狠)
                 if is_program_controlling and self.post_action:
                     now = time.time()
-                    if self.on_target_frames >= self.on_target_required and now - self.last_fire_time >= self.fire_min_interval:
+                    
+                    # 强制最小点击间隔保护 (Cooldown)，防止 10ms 这种极端设置导致系统卡死
+                    # 限制为最快每秒 50 次 (20ms)
+                    min_safe_interval = max(0.02, self.fire_min_interval)
+                    
+                    if self.on_target_frames >= self.on_target_required and now - self.last_fire_time >= min_safe_interval:
                         self._execute_post_action()
                         self.last_fire_time = now
                         self.on_target_frames = 0
-
-                    # D. 绘制调试信息 (如果检测到目标，即使不移动也显示)
-                    if self.show_debug and target is not None:
-                        try:
-                            # 确保坐标是有限的数值，且为整数
-                            if not math.isfinite(target_center_x) or not math.isfinite(target_center_y):
-                                raise ValueError("Invalid target coordinates (NaN/Inf)")
-                                
-                            draw_x, draw_y = int(target_center_x), int(target_center_y)
-                            cv2.circle(frame, (draw_x, draw_y), 5, (0, 0, 255), -1)
-                            cv2.putText(frame, "LOCKED", (draw_x + 10, draw_y), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        except (ValueError, OverflowError) as e:
-                            # 如果预判算出了非法数值，打印警告并跳过绘图
-                            # print(f"[Core] 坐标异常: {e}")
-                            pass
 
                 # E. 调试信息
                 if self.show_debug:
@@ -739,16 +911,33 @@ class AutoXController:
                     fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
                     prev_time = curr_time
 
+                    # 如果启用了局部推理，需要将所有检测框坐标映射回全局坐标用于显示
+                    display_results = results
+                    if self.use_fov_inference and results:
+                        display_results = []
+                        for (x1, y1, x2, y2, conf, cls) in results:
+                            display_results.append((
+                                x1 + offset_x, 
+                                y1 + offset_y, 
+                                x2 + offset_x, 
+                                y2 + offset_y, 
+                                conf, 
+                                cls
+                            ))
+
                     if not self.debug_queue.full():
                         debug_data = {
-                            "frame": frame.copy(),
-                            "results": results,
+                            "frame": frame, # 直接传递原始帧 (NumPy 数组)
+                            "results": display_results,
                             "target": target,
                             "center": (center_x, center_y),
                             "fov_size": self.fov_size,
                             "fps": int(fps)
                         }
-                        self.debug_queue.put(debug_data)
+                        try:
+                            self.debug_queue.put_nowait(debug_data)
+                        except queue.Full:
+                            pass # 队列满则丢弃，保证推理不阻塞
 
                 # 统计锁定延迟 (Capture -> Action Loop Done)
                 # 即使没有执行移动，也记录整个处理循环的耗时，作为系统端到端延迟的参考
@@ -773,9 +962,11 @@ class AutoXController:
         
         self.t_cap = threading.Thread(target=self._capture_loop, daemon=True)
         self.t_inf = threading.Thread(target=self._inference_loop, daemon=True)
+        self.t_input = threading.Thread(target=self._input_loop, daemon=True)
         
         self.t_cap.start()
         self.t_inf.start()
+        self.t_input.start()
         
         self.running = True
         print("[Core] 控制器已全面启动")
@@ -786,11 +977,54 @@ class AutoXController:
             return
             
         print("[Core] 正在停止控制器...")
-        self.stop_event.set()
-        self.t_cap.join(timeout=2)
-        self.t_inf.join(timeout=2)
         self.running = False
-        print("[Core] 控制器已安全关闭")
+        self.stop_event.set()
+        
+        # 1. 快速等待线程退出 (带更短的超时，避免 GUI 长时间挂起)
+        # 推理线程通常最重，给予 1.5s
+        if hasattr(self, 't_inf') and self.t_inf.is_alive():
+            self.t_inf.join(timeout=1.5)
+            if self.t_inf.is_alive():
+                print("[Core] 警告: 推理线程未能在超时时间内正常退出")
+                
+        # 采集线程通常很快，给予 0.5s
+        if hasattr(self, 't_cap') and self.t_cap.is_alive():
+            self.t_cap.join(timeout=0.5)
+            
+        # 输入线程给予 0.5s
+        if hasattr(self, 't_input') and self.t_input.is_alive():
+            self.t_input.join(timeout=0.5)
+            if self.t_input.is_alive():
+                print("[Core] 警告: 输入线程未能在超时时间内正常退出")
+
+        # 最终状态检查
+        active_threads = []
+        if hasattr(self, 't_inf') and self.t_inf.is_alive(): active_threads.append("Inference")
+        if hasattr(self, 't_cap') and self.t_cap.is_alive(): active_threads.append("Capture")
+        if hasattr(self, 't_input') and self.t_input.is_alive(): active_threads.append("Input")
+        
+        if active_threads:
+            print(f"[Core] 警告: 以下线程仍处于活跃状态: {', '.join(active_threads)}，可能因驱动或 CUDA 阻塞。")
+
+        # 2. 释放输入资源 (DD 驱动子进程)
+        if hasattr(self.input, 'cleanup'):
+            try:
+                # DDInput.cleanup 会调用 stop()，内部已有强制终止逻辑
+                self.input.cleanup()
+            except Exception as e:
+                print(f"[Core] Input cleanup failed: {e}")
+
+        # 3. 清理队列（防止内存泄漏和挂起）
+        # 注意：这里只清理我们自己创建的 queue.Queue
+        try:
+            while not self.frame_queue.empty():
+                self.frame_queue.get_nowait()
+            while not self.action_queue.empty():
+                self.action_queue.get_nowait()
+        except:
+            pass
+
+        print("[Core] 控制器已停止")
 
 if __name__ == "__main__":
     # 简单的本地冒烟测试

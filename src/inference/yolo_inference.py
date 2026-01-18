@@ -20,7 +20,7 @@ def apply_torch_safety_patch():
     except Exception:
         pass
 
-apply_torch_safety_patch()
+# apply_torch_safety_patch()  <-- 移除了这里的全局调用
 
 class YOLOInference(AbstractInference):
     """
@@ -77,6 +77,9 @@ class YOLOInference(AbstractInference):
             except ImportError:
                 pass
         
+        # 在禁用同步设置后，再应用安全补丁（补丁中包含 import ultralytics.nn.tasks，可能会触发初始化）
+        apply_torch_safety_patch()
+        
         self.model = YOLO(self.model_path)
         
         # 强制检查设备
@@ -98,86 +101,84 @@ class YOLOInference(AbstractInference):
             
         # 模型预热 (Warmup)
         # TensorRT 模型在第一次运行会有一定的初始化耗时
-        warmup_size = self.engine_imgsz if self.is_engine else 640
-        warmup_img = np.zeros((warmup_size, warmup_size, 3), dtype=np.uint8)
-        self.model.predict(
-            warmup_img, 
-            device=self.device, 
-            half=(self.device == 'cuda'), # 仅在 GPU 上使用 FP16
-            imgsz=warmup_size,
-            verbose=False
-        )
+        # 创建一个空图像进行预热，确保尺寸匹配
+        warmup_imgsz = self.engine_imgsz if self.is_engine else 640
+        dummy_input = np.zeros((warmup_imgsz, warmup_imgsz, 3), dtype=np.uint8)
+        
+        try:
+            self.model.predict(dummy_input, verbose=False, device=self.device, half=False)
+        except Exception as e:
+            print(f"[Inference] 预热失败: {e}")
+            
         print("[Inference] 模型加载并预热完成。")
 
-    def predict(self, frame_or_list):
-        """
-        执行推理并返回标准化的检测结果。
-        支持单帧 (np.ndarray) 或多帧 (List[np.ndarray]) 批处理。
-        返回格式: 
-            如果是单帧: List[tuple] (detections)
-            如果是多帧: List[List[tuple]] (batch_detections)
-        """
-        if self.model is None:
-            return [] if isinstance(frame_or_list, np.ndarray) else [[] for _ in frame_or_list]
-
-        is_batch = isinstance(frame_or_list, (list, tuple))
-        frames = frame_or_list if is_batch else [frame_or_list]
-
-        # 动态计算 imgsz (取第一帧，假设批次内尺寸一致)
-        if self.is_engine:
-            imgsz = self.engine_imgsz
-        else:
-            h, w = frames[0].shape[:2]
-            max_dim = max(h, w)
-            # 优化：平衡精度与性能
-            # 即使在全屏模式下，也不要超过 640，除非显卡非常强。
-            # 960 会导致推理耗时翻倍，产生明显的卡顿感。
-            # 为了解决不精准问题，我们依赖 sub-pixel 坐标，而不是单纯增加分辨率。
-            imgsz = max(320, min(640, ((max_dim + 31) // 32) * 32))
-
-        # 执行推理
-        try:
-            # 进一步精简参数，确保 TensorRT 运行在最快路径
-            results = self.model.predict(
-                source=frames,
-                imgsz=imgsz,
-                conf=self.conf_thres,
-                iou=self.iou_thres,
-                device=self.device,
-                half=True,
-                verbose=False,
-                show=False,
-                save=False,
-                stream=False,
-                augment=False,
-                agnostic_nms=False,
-                max_det=10,        # 进一步减少检测数，FPS 游戏通常只需要前几个目标
-                classes=self.target_class_ids if hasattr(self, 'target_class_ids') else None, # 在推理层过滤类别，减少后处理
-                rect=True          # 开启矩形推理，减少填充导致的无效计算
-            )
-        except Exception as e:
-            # 如果批处理失败（通常是 TensorRT Engine 固定了 batch size）
-            if is_batch:
-                # 降级为循环单次推理
-                results = []
-                for f in frames:
-                    res = self.model.predict(
-                        source=f, imgsz=imgsz, conf=self.conf_thres, iou=self.iou_thres,
-                        device=self.device, half=True, verbose=False, max_det=20
-                    )
-                    results.extend(res)
-            else:
-                raise e
-
-        batch_detections = []
-        for result in results:
-            detections = []
-            if result.boxes is not None:
-                # 优化：直接从 tensor 批量转换 numpy
-                boxes_data = result.boxes.data.cpu().numpy()
-                for i in range(len(boxes_data)):
-                    b = boxes_data[i]
-                    detections.append((int(b[0]), int(b[1]), int(b[2]), int(b[3]), b[4], int(b[5])))
-            batch_detections.append(detections)
+    def predict(self, frame_or_frames):
+        import time
+        t_start = time.perf_counter()
         
-        return batch_detections if is_batch else batch_detections[0]
+        # 兼容单帧和多帧 (Batch)
+        is_batch = isinstance(frame_or_frames, list)
+        
+        # 增加异常捕获
+        try:
+            # 执行推理
+            # verbose=False: 减少日志
+            # iou=self.iou_thres: NMS 阈值
+            # conf=self.conf_thres: 置信度阈值
+            
+            # [DEBUG] 打印推理前时间点
+            # print(f"[Inf-Debug] Start Predict: {time.perf_counter():.4f}", flush=True)
+            
+            # 强制同步 CUDA 流，确保之前的 GPU 操作（如 DDA 采集）已完成
+            # 这有助于避免资源冲突，虽然会轻微增加 CPU 等待时间
+            if self.device == 'cuda':
+                torch.cuda.synchronize()
+
+            results = self.model.predict(
+                frame_or_frames, 
+                verbose=False, 
+                device=self.device,
+                iou=self.iou_thres,
+                conf=self.conf_thres,
+                half=False # 强制使用 FP32，避免 TensorRT FP16 精度问题或崩溃
+            )
+            
+            # [DEBUG] 打印推理后时间点
+            # print(f"[Inf-Debug] End Predict: {time.perf_counter():.4f}", flush=True)
+            
+        except Exception as e:
+            print(f"[Inference] 推理异常: {e}")
+            return [] if is_batch else []
+
+        t_post = time.perf_counter()
+        parsed_results = []
+        for result in results:
+            # 提取检测框
+            boxes = result.boxes
+            frame_detections = []
+            
+            if boxes is not None:
+                # 遍历所有检测到的目标
+                # boxes.data 包含 (x1, y1, x2, y2, conf, cls)
+                for box in boxes.data:
+                    x1, y1, x2, y2, conf, cls = box.tolist()
+                    
+                    # 再次过滤 (双重保险)
+                    if conf >= self.conf_thres:
+                        # 坐标取整
+                        frame_detections.append((
+                            int(x1), int(y1), int(x2), int(y2), 
+                            float(conf), int(cls)
+                        ))
+            
+            parsed_results.append(frame_detections)
+        
+        # [DEBUG] 耗时检测
+        # dt = (time.perf_counter() - t_start) * 1000
+        # if dt > 50:
+        #    print(f"[Inference] Slow batch: {dt:.1f}ms (Infer: {(t_post - t_start)*1000:.1f}ms)", flush=True)
+            
+        # 如果输入是单帧，返回单个结果列表；如果是 Batch，返回列表的列表
+        if not is_batch:
+            return parsed_results[0]
+        return parsed_results

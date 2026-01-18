@@ -13,16 +13,13 @@ class ConfigManager:
             "conf_thres": 0.4,
             "iou_thres": 0.45,
             "device": "cuda",
-            "target_classes": [0]  # 0: person
+            "target_classes": [0],  # 0: person
+            "max_fps": 60
         },
         "input": {
+            "input_method": "dd", # dd or win32
             "fov": 500,
             "auto_lock": True,
-            "move_speed": "normal", # fast, normal, slow, custom
-            "custom_speed_ms": 10,
-            "custom_speed_random": 5,
-            "human_curve": False,
-            "offset_radius": 0,
             "mouse_sensitivity": 1.0,
             "move_key": "RButton",
             "post_action": "", # e.g., "LButton", "RButton", "Ctrl+A"

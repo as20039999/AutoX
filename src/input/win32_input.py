@@ -74,8 +74,13 @@ class Win32Input(AbstractInput):
         if dx == 0 and dy == 0:
             return
 
-        steps = max(int(duration * 100), 5)  # 至少 5 步，频率约 100Hz
+        target_freq = 60
+        steps = max(int(duration * target_freq), 1)
         interval = duration / steps
+        
+        # 强制最小间隔，防止过高频调用导致系统中断风暴
+        if interval < 0.016:
+            interval = 0.016
         
         current_dx = 0
         current_dy = 0

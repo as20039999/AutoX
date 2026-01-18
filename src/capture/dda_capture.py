@@ -1,4 +1,3 @@
-import cv2
 import numpy as np
 import mss
 import dxcam
@@ -38,8 +37,9 @@ class MSSCapture(AbstractCapture):
         if not self.is_running:
             return None
         sct_img = self.sct.grab(self.monitor)
-        frame = np.array(sct_img)
-        return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        # mss 返回的是 BGRA，直接切片取前三个通道即为 BGR
+        # 替代 cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        return np.array(sct_img)[:, :, :3]
 
 class DDACapture(AbstractCapture):
     """
@@ -72,9 +72,9 @@ class DDACapture(AbstractCapture):
         )
         if self.camera:
             # 启动缓存循环
-            # target_fps 设为 0 表示不限制采集频率，尽力而为
+            # target_fps 设为 30，避免过度占用 GPU 导致推理线程饥饿或死锁
             # video_mode=True 对于高频采集很有帮助
-            self.camera.start(target_fps=0, video_mode=True)
+            self.camera.start(target_fps=30, video_mode=True)
             self.is_running = True
         else:
             raise RuntimeError("Failed to initialize DXCAM (DDA).")
@@ -82,19 +82,14 @@ class DDACapture(AbstractCapture):
     def stop(self):
         if self.camera:
             try:
-                # dxcam 在 stop 时会打印 "Screen Capture FPS: ... "，
-                # 有时会出现错误的巨大数值（如 320亿），这里屏蔽其输出
-                import os
-                import sys
-                from contextlib import redirect_stdout
-                
-                with open(os.devnull, 'w') as fnull:
-                    with redirect_stdout(fnull):
-                        self.camera.stop()
-            except Exception:
-                # 如果屏蔽失败，就直接 stop
+                # 显式停止采集循环
                 self.camera.stop()
-            self.camera = None
+            except Exception as e:
+                print(f"[Capture] DXCAM stop error: {e}")
+            finally:
+                # 销毁对象，释放显存/显存映射
+                del self.camera
+                self.camera = None
         self.is_running = False
 
     def get_frame(self) -> np.ndarray:

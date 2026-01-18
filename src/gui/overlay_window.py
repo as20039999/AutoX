@@ -16,8 +16,9 @@ class OverlayWindow(QWidget):
         self.setWindowFlags(
             Qt.FramelessWindowHint |       # 无边框
             Qt.WindowStaysOnTopHint |      # 置顶
-            Qt.Tool |                      # 工具窗口（不在任务栏显示）
-            Qt.WindowTransparentForInput   # 鼠标穿透 (Qt 5.10+ 支持)
+            Qt.Tool |                      # 工具窗口
+            Qt.WindowTransparentForInput | # 鼠标穿透
+            Qt.WindowDoesNotAcceptFocus    # 彻底不接受焦点，防止 Alt 键拦截
         )
         
         # 2. 设置背景透明
