@@ -714,7 +714,7 @@ class MainWindow(QMainWindow):
         self.max_fps_spin.setSingleStep(5)
         self.max_fps_spin.setSuffix(" FPS")
         self.max_fps_spin.valueChanged.connect(self._on_config_changed)
-        infer_layout.addLayout(create_row("最高 FPS", self.max_fps_spin, "设置推理频率上限。最高 30 FPS，较低的 FPS 可以显著降低 CPU/GPU 负载，防止系统过热或游戏掉帧。"))
+        infer_layout.addLayout(create_row("最高 FPS", self.max_fps_spin, "设置推理频率上限。最高 60 FPS，较高的 FPS 能提供更鲜活的图像，较低的 FPS 可以降低 CPU/GPU 负载。"))
 
         # 推理中心
         self.fov_center_combo = QComboBox()
@@ -1199,7 +1199,7 @@ class MainWindow(QMainWindow):
         self._loading_config = True
         
         self.conf_spin.setValue(self.config.get("inference.conf_thres"))
-        self.max_fps_spin.setValue(self.config.get("inference.max_fps", 30))
+        self.max_fps_spin.setValue(self.config.get("inference.max_fps", 60))
         self.debug_check.setChecked(self.config.get("gui.show_debug"))
         self.overlay_check.setChecked(False) # 默认不开启，避免遮挡
         self.fov_inference_check.setChecked(self.config.get("inference.use_fov_inference", False))

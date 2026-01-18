@@ -239,9 +239,17 @@ class DDInput(AbstractInput):
 
     def init_driver(self):
         """
-        兼容接口：不需要做任何事，因为子进程已在 __init__ 中启动
+        初始化驱动：重置停止状态并确保子进程正在运行
         """
-        pass
+        self.is_stopping = False
+        # 清除所有单次日志标记，允许在新会话中重新打印
+        for attr in ['_logged_disabled', '_logged_process_dead', '_logged_queue_full']:
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        if self.enabled and (self.process is None or not self.process.is_alive()):
+            print("[DDInput] 检测到子进程未运行，正在初始化/重启...")
+            self._restart_process()
 
     def move_to(self, x: int, y: int):
         """绝对移动"""
@@ -297,6 +305,8 @@ class DDInput(AbstractInput):
         try:
             # 清理旧进程
             self.stop()
+            # 必须重置停止标志，否则后续无法发送指令
+            self.is_stopping = False
             
             # 重新初始化
             dll_path = get_asset_path("ddxoft/ddhid60400.dll")

@@ -96,7 +96,7 @@ class AutoXController:
         self.screen_center = (self.input.screen_width // 2, self.input.screen_height // 2)
         
         # FPS 限制
-        self.max_fps = self.config.get("inference.max_fps", 30)
+        self.max_fps = self.config.get("inference.max_fps", 60)
         self.last_frame_time = 0
         
         # 批处理配置
@@ -104,7 +104,7 @@ class AutoXController:
         self.max_batch_size = 4 # 最大允许批次大小
         
         # FPS 限制
-        self.target_fps = 30
+        self.target_fps = 60
 
         # 4. 鼠标运动监控 (防抖与用户优先策略)
         # 阈值 30px, 冷却 50ms (0.05s)
@@ -207,12 +207,17 @@ class AutoXController:
                     print(f"[Core] 采集异常: {e}")
                     time.sleep(0.01)
                 
-                # FPS 限制
+                # 优化：移除硬性 sleep，依靠 capture.get_frame() 的内部频率控制
+                # 或采用极短休眠避免空转 CPU
                 if self.target_fps > 0:
                     elapsed = time.perf_counter() - loop_start
+                    # 提高容忍度，只有当明显超过目标频率时才休眠
                     wait_time = (1.0 / self.target_fps) - elapsed
-                    if wait_time > 0:
+                    if wait_time > 0.001: # 只有大于 1ms 才休眠
                         time.sleep(wait_time)
+                    else:
+                        # 即使不休眠，也给系统调度一点机会
+                        time.sleep(0.0001) 
 
         finally:
             self.capture.stop()

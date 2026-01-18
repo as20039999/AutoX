@@ -72,9 +72,9 @@ class DDACapture(AbstractCapture):
         )
         if self.camera:
             # 启动缓存循环
-            # target_fps 设为 30，避免过度占用 GPU 导致推理线程饥饿或死锁
+            # target_fps 设为 60，以支持更高刷新率，确保推理模块获取最新帧
             # video_mode=True 对于高频采集很有帮助
-            self.camera.start(target_fps=30, video_mode=True)
+            self.camera.start(target_fps=60, video_mode=True)
             self.is_running = True
         else:
             raise RuntimeError("Failed to initialize DXCAM (DDA).")
