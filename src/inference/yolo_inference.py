@@ -81,6 +81,7 @@ class YOLOInference(AbstractInference):
         apply_torch_safety_patch()
         
         self.model = YOLO(self.model_path)
+        self.project_root = get_root_path()
         
         # 强制检查设备
         if self.device == 'cuda' and not torch.cuda.is_available():
@@ -106,7 +107,16 @@ class YOLOInference(AbstractInference):
         dummy_input = np.zeros((warmup_imgsz, warmup_imgsz, 3), dtype=np.uint8)
         
         try:
-            self.model.predict(dummy_input, verbose=False, device=self.device, half=False)
+            self.model.predict(
+                dummy_input, 
+                verbose=False, 
+                device=self.device, 
+                half=False, 
+                save=False,
+                project=self.project_root,
+                name=".", # 指向已存在的根目录
+                exist_ok=True
+            )
         except Exception as e:
             print(f"[Inference] 预热失败: {e}")
             
@@ -140,7 +150,11 @@ class YOLOInference(AbstractInference):
                 device=self.device,
                 iou=self.iou_thres,
                 conf=self.conf_thres,
-                half=False # 强制使用 FP32，避免 TensorRT FP16 精度问题或崩溃
+                half=False, # 强制使用 FP32，避免 TensorRT FP16 精度问题或崩溃
+                save=False,
+                project=self.project_root,
+                name=".",
+                exist_ok=True
             )
             
             # [DEBUG] 打印推理后时间点
