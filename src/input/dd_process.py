@@ -65,8 +65,10 @@ def dd_worker_process(cmd_queue, status_queue, dll_path):
     # 命令循环
     last_action_time = 0.0
     # 严格遵守驱动要求：最小间隔 10ms (100Hz)
-    # 否则驱动可能 down
     min_action_interval = 0.010
+    
+    # 指令合并缓存
+    pending_cmd = None
 
     while True:
         try:
@@ -76,11 +78,9 @@ def dd_worker_process(cmd_queue, status_queue, dll_path):
             time_since_last = now - last_action_time
             time_to_wait_for_interval = max(0.0, min_action_interval - time_since_last)
 
-            # 2. 处理已到期的延迟事件 (例如按键抬起)
-            # 必须同时满足：事件时间已到 且 距离上次操作已过 10ms
+            # 2. 处理已到期的延迟事件
             if pending_events and pending_events[0][0] <= now:
                 if time_to_wait_for_interval > 0:
-                    # 虽然事件到期了，但为了保护驱动，仍需等待间隔
                     time.sleep(time_to_wait_for_interval)
                     now = time.time()
                 
@@ -92,30 +92,44 @@ def dd_worker_process(cmd_queue, status_queue, dll_path):
                     dd_dll.DD_btn(*args)
                 
                 last_action_time = time.time()
-                continue # 执行完一个操作后，重新进入循环检查间隔
-
-            # 3. 计算下一次阻塞获取的超时时间
-            # 我们希望在以下任一情况发生时唤醒：
-            # a) 间隔保护到期 (time_to_wait_for_interval)
-            # b) 延迟事件到期 (pending_events[0][0] - now)
-            # c) 默认最大等待 (0.01s)
-            
-            wait_timeout = 0.01 
-            if time_to_wait_for_interval > 0:
-                wait_timeout = min(wait_timeout, time_to_wait_for_interval)
-            
-            if pending_events:
-                event_wait = max(0.0, pending_events[0][0] - now)
-                wait_timeout = min(wait_timeout, event_wait)
-            
-            # 如果 wait_timeout 太小（例如接近 0），强制给一个极小值避免死循环
-            wait_timeout = max(0.001, wait_timeout)
-
-            # 4. 阻塞获取新命令
-            try:
-                cmd_data = cmd_queue.get(timeout=wait_timeout)
-            except queue.Empty:
                 continue
+
+            # 3. 获取新命令
+            if pending_cmd is not None:
+                cmd_data = pending_cmd
+                pending_cmd = None
+            else:
+                wait_timeout = 0.01 
+                if time_to_wait_for_interval > 0:
+                    wait_timeout = min(wait_timeout, time_to_wait_for_interval)
+                if pending_events:
+                    event_wait = max(0.0, pending_events[0][0] - now)
+                    wait_timeout = min(wait_timeout, event_wait)
+                
+                wait_timeout = max(0.001, wait_timeout)
+
+                try:
+                    cmd_data = cmd_queue.get(timeout=wait_timeout)
+                except queue.Empty:
+                    continue
+
+            # 4. 指令合并逻辑 (针对 move_rel)
+            # 如果当前指令是位移，则尝试合并队列中后续的所有连续位移指令
+            if cmd_data[0] == "move_rel":
+                merged_dx, merged_dy = cmd_data[1], cmd_data[2]
+                try:
+                    while True:
+                        next_cmd = cmd_queue.get_nowait()
+                        if next_cmd[0] == "move_rel":
+                            merged_dx += next_cmd[1]
+                            merged_dy += next_cmd[2]
+                        else:
+                            # 遇到了非位移指令，存起来下一轮处理
+                            pending_cmd = next_cmd
+                            break
+                except queue.Empty:
+                    pass
+                cmd_data = ("move_rel", merged_dx, merged_dy)
 
             # 5. 准备执行命令，先检查并等待 10ms 间隔
             now = time.time()
