@@ -421,10 +421,15 @@ class AutoXController:
                 # 更新鼠标监控状态
                 self.mouse_monitor.update()
                 
+                self.last_inference_tick = time.perf_counter()
+                
                 try:
                     # 尽可能清空队列，只取最后一帧，保证实时性（跳过积压帧）
                     # 阻塞获取第一帧，超时 100ms
-                    item = self.frame_queue.get(timeout=0.1)
+                    try:
+                        item = self.frame_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
                     
                     # 检查停止信号，如果已停止则立即退出
                     if self.stop_event.is_set():
@@ -433,22 +438,22 @@ class AutoXController:
                     batch_items = [item]
                     
                     # 丢弃积压的旧帧，只留最后一帧
+                    # 这是防止推理卡死后堆积旧帧的关键：永远处理“现在”的画面
                     while not self.frame_queue.empty():
                         try:
+                            # 记录丢弃的帧，防止积压
                             batch_items = [self.frame_queue.get_nowait()]
                         except queue.Empty:
                             break
                     
-                    # 再次检查停止信号
-                    if self.stop_event.is_set():
-                        break
-                    
-                    # 记录开始推理的时间点
-                    self.last_frame_time = time.perf_counter()
-                    
-                    # 解包 batch_items -> batch_frames
-                    # batch_items 存储格式为 (frame, capture_time)
+                    # 获取当前帧的捕获时间
                     frame, current_frame_capture_time = batch_items[0]
+                    
+                    # 增加 Watchdog 检查：如果这一帧已经积压超过 2 秒，说明系统严重卡顿
+                    # 我们丢弃它并打印警告，防止在旧画面上执行错误操作
+                    if time.perf_counter() - current_frame_capture_time > 2.0:
+                        print(f"[Core] 🔴 Watchdog: Frame stale (>2s). Purging queue...", flush=True)
+                        continue
                     h, w = frame.shape[:2]
                     
                     if self.fov_center_mode == "mouse":

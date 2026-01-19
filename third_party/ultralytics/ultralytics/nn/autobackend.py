@@ -785,14 +785,15 @@ class AutoBackend(nn.Module):
             assert im.shape == s, f"input size {im.shape} {'>' if self.dynamic else 'not equal to'} max model size {s}"
             self.binding_addrs["images"] = int(im.data_ptr())
             # Fix: Use async execution to avoid inference thread hanging on Windows
-            # TensorRT 8.5+ uses execute_async_v2, older versions use enqueue_v2
+            # TensorRT 10+ uses execute_async_v3, 8.5+ uses execute_async_v2, older versions use enqueue_v2
             binding_addrs = list(self.binding_addrs.values())
             stream = torch.cuda.current_stream().cuda_stream
             
             # Fix: Try async execution first using try-except to handle potential hasattr issues or version discrepancies
             try:
                 # Try TensorRT 10+ async execution first if available
-                if self.is_trt10 and hasattr(self.context, "execute_async_v3"):
+                # TRT 10 requires set_tensor_address for each input/output
+                if hasattr(self.context, "execute_async_v3"):
                     for name, addr in self.binding_addrs.items():
                         self.context.set_tensor_address(name, addr)
                     self.context.execute_async_v3(stream_handle=stream)
