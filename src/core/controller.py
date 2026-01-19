@@ -115,7 +115,7 @@ class AutoXController:
 
         # [优化] 置信度滞后逻辑 (Confidence Hysteresis)
         # 初始锁定需要较高的置信度，但一旦锁定，允许置信度稍微下降而不丢失目标
-        self.lock_conf_thres = self.config.get("inference.conf_thres", 0.4)
+        self.lock_conf_thres = self.config.get("inference.conf_thres", 0.5) # 提高默认门槛到 0.5，减少垃圾框
         # 将推理引擎的基础置信度降低，以便我们在 controller 中进行更灵活的过滤
         self.inference.conf_thres = max(0.1, self.lock_conf_thres - 0.1)
         
@@ -125,17 +125,16 @@ class AutoXController:
         
         # 进阶控制算法
         self.kf = KalmanFilter()
-        self.kalman_enabled = True      # 开启卡尔曼滤波，减少预测跳动
-        self.ema_enabled = True         # 开启 EMA 平滑，减少高频抖动
-        self.ema_alpha = 0.5            # 调小 alpha，增加平滑度
+        self.kalman_enabled = False     # 禁用卡尔曼滤波，防止预测冲突导致的抖动
+        self.ema_enabled = False        # 禁用所有平滑处理，追求直接响应
         
-        # 动态 PID 配置
+        # 动态 PID 配置 (稳准狠)
         self.dynamic_pid_enabled = True # 开启动态 PID
-        self.pid_kp_min = 0.45          # 近距离时的 KP (追求稳)
-        self.pid_kp_max = 0.85          # 远距离时的 KP (追求狠)
+        self.pid_kp_min = 0.50          # 近距离 KP (稳)
+        self.pid_kp_max = 1.00          # 远距离 KP (狠)
         self.pid_kp = self.pid_kp_min
         self.pid_ki = 0.00
-        self.pid_kd = 0.08
+        self.pid_kd = 0.20              # 进一步增加 KD 值，强力抑制超调抖动 (稳)
         self.last_target_center = None
         self.last_target_box = None
         self.locked_conf = 0.0
@@ -150,6 +149,10 @@ class AutoXController:
         self.lock_retain_radius = 150   # 进一步扩大锁定保留范围，增强粘滞性
         self.switch_delay_frames = 0    # 目标切换防抖计数器
         self.switch_threshold = 5       # 目标切换防抖阈值 (帧)，约 80-100ms
+        
+        # [已移除] 平滑历史记录 (移除 EMA/Snap 逻辑)
+        self.box_history = []
+        
         self.error_sum_x = 0
         self.error_sum_y = 0
         self.last_error_x = 0
@@ -439,15 +442,8 @@ class AutoXController:
                     if self.fov_center_mode == "mouse":
                         pt = POINT()
                         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-                        # 修复：将全局鼠标坐标转换为相对于采集窗口的坐标
-                        # 这里假设 capture.region 包含了 (left, top, width, height)
-                        # 如果是全屏采集，region 为 None 或 (0,0,w,h)
-                        if hasattr(self.capture, 'region') and self.capture.region:
-                            center_x = pt.x - self.capture.region[0]
-                            center_y = pt.y - self.capture.region[1]
-                        else:
-                            # 默认假设是主屏幕采集
-                            center_x, center_y = pt.x, pt.y
+                        center_x = pt.x - (self.capture.region[0] if hasattr(self.capture, 'region') and self.capture.region else 0)
+                        center_y = pt.y - (self.capture.region[1] if hasattr(self.capture, 'region') and self.capture.region else 0)
                     else:
                         center_x, center_y = w // 2, h // 2
 
@@ -468,6 +464,7 @@ class AutoXController:
                         break
                         
                     results = self.inference.predict(inference_frame)
+                    
                     inf_batch = 1
                     
                     # 更新帧计数用于 FPS 计算
@@ -736,17 +733,8 @@ class AutoXController:
                     target_height = ty2 - ty1
                     raw_target_y = ty1 + (target_height * self.aim_offset_y)
                     
-                    # 引入指数平滑 (EMA)，进一步过滤高频抖动 (稳)
-                    if self.ema_enabled:
-                        if self.last_target_center is not None:
-                            target_center_x = self.ema_alpha * raw_target_x + (1 - self.ema_alpha) * self.last_target_center[0]
-                            target_center_y = self.ema_alpha * raw_target_y + (1 - self.ema_alpha) * self.last_target_center[1]
-                        else:
-                            target_center_x = raw_target_x
-                            target_center_y = raw_target_y
-                    else:
-                        target_center_x = raw_target_x
-                        target_center_y = raw_target_y
+                    target_center_x = raw_target_x
+                    target_center_y = raw_target_y
                     
                     self.last_target_center = (target_center_x, target_center_y)
                     self.last_target_box = (tx1, ty1, tx2, ty2)
@@ -809,13 +797,13 @@ class AutoXController:
                     # 动态 PID 核心逻辑：根据距离调整 KP (稳准狠)
                     if self.dynamic_pid_enabled:
                         # 距离越远，KP 越大 (狠)；距离越近，KP 越小 (稳)
-                        # 设定 100 像素为最大增益距离
-                        scale = min(1.0, dist / 100.0)
+                        # 设定 120 像素为最大增益距离
+                        scale = min(1.0, dist / 120.0)
                         current_kp = self.pid_kp_min + (self.pid_kp_max - self.pid_kp_min) * scale
                     else:
                         current_kp = self.pid_kp
 
-                    deadzone = 1.5  # 略微增大死区，配合 EMA 平滑
+                    deadzone = 1.2  # 减小死区提高精度 (准)，依靠 KD 抑制抖动 (稳)
                     if dist < deadzone:
                         self.on_target_frames += 1
                         error_x, error_y = 0.0, 0.0
@@ -939,11 +927,12 @@ class AutoXController:
                     if self.use_fov_inference and results:
                         display_results = []
                         for (x1, y1, x2, y2, conf, cls) in results:
+                            # 映射回全局坐标并取整，彻底消除渲染层的次像素抖动
                             display_results.append((
-                                x1 + offset_x, 
-                                y1 + offset_y, 
-                                x2 + offset_x, 
-                                y2 + offset_y, 
+                                int(x1 + offset_x), 
+                                int(y1 + offset_y), 
+                                int(x2 + offset_x), 
+                                int(y2 + offset_y), 
                                 conf, 
                                 cls
                             ))

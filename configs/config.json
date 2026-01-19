@@ -7,7 +7,7 @@
         "target_classes": [
             0
         ],
-        "max_fps": 30,
+        "max_fps": 60,
         "use_fov_inference": true,
         "fov_center_mode": "screen"
     },
