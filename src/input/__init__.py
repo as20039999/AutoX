@@ -11,6 +11,9 @@ def create_input(method="dd"):
     elif method == "win32":
         from .win32_input import Win32Input
         return Win32Input()
+    elif method == "syscall":
+        from .syscall_input import SyscallInput
+        return SyscallInput()
     
     # 默认回退到 DD (或者可以改为报错)
     print(f"[Input] 未知输入方法 '{method}'，默认使用 DD")

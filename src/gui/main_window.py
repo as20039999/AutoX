@@ -756,7 +756,7 @@ class MainWindow(QMainWindow):
 
         # 输入驱动选择
         self.input_method_combo = QComboBox()
-        self.input_method_combo.addItems(["DD Input (推荐)", "Win32 Input (兼容)"])
+        self.input_method_combo.addItems(["DD Input (推荐)", "Win32 Input (兼容)", "Syscall Input (隐藏调用)"])
         self.input_method_combo.currentIndexChanged.connect(self._on_input_method_changed)
         input_layout.addLayout(create_row("输入驱动", self.input_method_combo, "选择输入驱动类型。切换后需要重启程序生效。"))
 
@@ -1211,7 +1211,8 @@ class MainWindow(QMainWindow):
         
         # 输入驱动加载
         input_method = self.config.get("input.input_method", "dd")
-        self.input_method_combo.setCurrentIndex(0 if input_method == "dd" else 1)
+        method_map = {"dd": 0, "win32": 1, "syscall": 2}
+        self.input_method_combo.setCurrentIndex(method_map.get(input_method, 0))
 
         # 行为设置加载
         self.auto_lock_check.setChecked(self.config.get("input.auto_lock", True))
@@ -1309,7 +1310,13 @@ class MainWindow(QMainWindow):
         trigger_mode_val = "manual"
         toggle_key_val = self.toggle_key_recorder.get_key()
         move_key_val = self.move_key_recorder.get_key()
-        input_method_val = "dd" if self.input_method_combo.currentIndex() == 0 else "win32"
+# 获取输入驱动
+        method_idx = self.input_method_combo.currentIndex()
+        input_method_val = "dd"
+        if method_idx == 1:
+            input_method_val = "win32"
+        elif method_idx == 2:
+            input_method_val = "syscall"
         
         # 行为设置获取
         auto_lock_val = self.auto_lock_check.isChecked()
