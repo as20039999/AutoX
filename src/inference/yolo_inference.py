@@ -81,12 +81,21 @@ class YOLOInference(AbstractInference):
         apply_torch_safety_patch()
         
         self.model = YOLO(self.model_path, task='detect')
+        # 只有对于 .pt 模型才需要/支持显式 .to(device)
+        # 导出格式如 .engine, .onnx 不支持此方法，会在 predict 时处理设备
+        if self.model_path.endswith('.pt'):
+            self.model.to(self.device)
+        
         self.project_root = get_root_path()
         
         # 强制检查设备
         if self.device == 'cuda' and not torch.cuda.is_available():
             print("[Inference] 警告: 指定了 CUDA 但不可用，回退到 CPU 模式")
             self.device = 'cpu'
+        
+        if self.device == 'cuda':
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"[Inference] 正在使用 GPU: {gpu_name}")
             
         mode_name = "TensorRT" if use_trt else "PyTorch"
         print(f">>> 运行模式: {mode_name} (Device: {self.device}) <<<")
@@ -154,12 +163,12 @@ class YOLOInference(AbstractInference):
                 results = self._predict_gpu(frame_or_frames)
             else:
                 results = self.model.predict(
-                    frame_or_frames, 
+                    source=frame_or_frames, 
                     verbose=False, 
-                    device=self.device,
+                    device=self.device, # 显式指定设备，解决双显卡识别问题
                     iou=self.iou_thres,
                     conf=self.conf_thres,
-                    half=False, # 强制使用 FP32，避免 TensorRT FP16 精度问题或崩溃
+                    half=True, # 使用半精度加速 (FP16)
                     save=False,
                     project=self.project_root,
                     name=".",

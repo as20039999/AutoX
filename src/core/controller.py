@@ -85,6 +85,15 @@ class AutoXController:
         #     print(f"[Core] 提升优先级失败: {e}")
 
     def _init_params(self):
+        # 健康监控 (用于排查长时间运行后的卡顿/泄露)
+        self.last_capture_tick = time.perf_counter()
+        self.last_inference_tick = time.perf_counter()
+        self.last_input_tick = time.perf_counter()
+        self.process = psutil.Process()
+        self.process.cpu_percent() # 首次调用，初始化计数器
+        self.cpu_count = psutil.cpu_count() or 1
+        self.start_time = time.time()
+
         # 2. 线程间通信
         self.frame_queue = queue.Queue(maxsize=5)  # 采集 -> 推理 (增大以支持批处理)
         self.debug_queue = queue.Queue(maxsize=1)  # 推理 -> UI (仅用于调试)
@@ -208,6 +217,7 @@ class AutoXController:
         self.capture.start()
         try:
             while not self.stop_event.is_set():
+                self.last_capture_tick = time.perf_counter()
                 loop_start = time.perf_counter()
                 try:
                     # 尝试使用 GPU 零拷贝采集
@@ -265,6 +275,7 @@ class AutoXController:
         min_interval = 0.002
         
         while not self.stop_event.is_set():
+            self.last_input_tick = time.perf_counter()
             try:
                 # --- 1. 处理鼠标移动 (优先级高，需流畅) ---
                 cmd = None
@@ -400,6 +411,7 @@ class AutoXController:
         
         last_log_time = time.time()
         while not self.stop_event.is_set():
+            self.last_inference_tick = time.perf_counter()
             try:
                 # 核心实时性优化：移除推理端的频率限制（max_fps），由采集端（target_fps）统一控速。
                 # 推理端只需尽快消费队列中的最新帧，从而消除相位差带来的额外延迟。
@@ -480,7 +492,7 @@ class AutoXController:
                     if inf_latency_ms > 100:
                          print(f"[Core] Warning: High Latency Detected! Inf-Lat: {inf_latency_ms:.1f}ms (Possible Freeze)", flush=True)
 
-                    # 每 10 秒打印一次系统资源报告
+                    # 每 10 秒打印一次深度健康报告
                     curr_time = now
                     if curr_time - self.last_report_time >= 10.0:
                         elapsed = curr_time - self.last_report_time
@@ -489,20 +501,40 @@ class AutoXController:
                         avg_lock = self.total_lock_latency / self.lock_count if self.lock_count > 0 else 0
                         avg_cap_lock = self.total_capture_to_lock_latency / self.capture_to_lock_count if self.capture_to_lock_count > 0 else 0
                         
-                        # 优化：打印更直观的系统资源报告
-                        cpu_usage = psutil.cpu_percent()
-                        mem_info = psutil.virtual_memory()
+                        # --- 深度监控指标 ---
+                        # 1. 线程心跳 (检测线程是否卡死)
+                        now_tick = time.perf_counter()
+                        cap_alive = (now_tick - self.last_capture_tick) < 2.0
+                        inf_alive = (now_tick - self.last_inference_tick) < 2.0
+                        input_alive = (now_tick - self.last_input_tick) < 2.0
                         
-                        # 获取 GPU 显存占用 (仅使用 torch 避免 subprocess 阻塞)
-                        gpu_mem_used = 0.0
-                        try:
-                            # free_mem, total_mem = torch.cuda.mem_get_info()
-                            # gpu_mem_used = (total_mem - free_mem) / 1024**2
-                            pass # 暂时禁用 GPU 信息查询以避免阻塞
-                        except:
-                            pass
+                        # 2. 资源泄露监控
+                        handle_count = self.process.num_handles() if hasattr(self.process, 'num_handles') else 0
+                        # 使用 psutil 的系统级百分比以获取更准确的 CPU 比例（或者在计算进程百分比时提供 interval）
+                        # 这里 we 改用 process.cpu_percent(interval=None) 并确保计算方式正确
+                        raw_cpu = self.process.cpu_percent()
+                        cpu_usage = raw_cpu / self.cpu_count
+                        mem_info = self.process.memory_info()
+                        mem_rss_mb = mem_info.rss / 1024**2
+                        
+                        # 3. GPU 显存监控 (排查张量泄露)
+                        gpu_reserved_mb = torch.cuda.memory_reserved() / 1024**2
+                        gpu_allocated_mb = torch.cuda.memory_allocated() / 1024**2
+                        
+                        # 4. 队列堆积监控
+                        q_size = self.frame_queue.qsize()
 
-                        print(f"[System] FPS: {fps:.1f} | Inf-Lat: {avg_inf:.1f}ms | Lock-Lat: {avg_lock:.1f}ms | Cap-Target: {avg_cap_lock:.1f}ms | CPU: {cpu_usage}% | MEM: {mem_info.percent}%", flush=True)
+                        # 打印综合健康报告
+                        print(f"\n[Monitor] --- System Health Report (Uptime: {int(time.time() - self.start_time)}s) ---", flush=True)
+                        print(f"[Monitor] Threads: Capture({'OK' if cap_alive else 'DEAD'}, {(now_tick-self.last_capture_tick)*1000:.0f}ms), "
+                              f"Inference({'OK' if inf_alive else 'OK'}, {(now_tick-self.last_inference_tick)*1000:.0f}ms), "
+                              f"Input({'OK' if input_alive else 'DEAD'}, {(now_tick-self.last_input_tick)*1000:.0f}ms)", flush=True)
+                        print(f"[Monitor] Performance: FPS: {fps:.1f} | Inf-Lat: {avg_inf:.1f}ms | Cap-Target: {avg_cap_lock:.1f}ms", flush=True)
+                        print(f"[Monitor] Resources: Handles: {handle_count} | RAM-RSS: {mem_rss_mb:.0f}MB | GPU-Res: {gpu_reserved_mb:.0f}MB | GPU-Alloc: {gpu_allocated_mb:.0f}MB", flush=True)
+                        print(f"[Monitor] Status: Queue: {q_size}/5 | CPU: {cpu_usage:.1f}%", flush=True)
+                        if not cap_alive or not input_alive:
+                            print(f"[Monitor] 🔴 WARNING: THREAD STALL DETECTED!", flush=True)
+                        print("-" * 50 + "\n", flush=True)
                         
                         self.frame_count = 0
                         self.total_inf_latency = 0.0
