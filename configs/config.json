@@ -12,7 +12,7 @@
         "fov_center_mode": "screen"
     },
     "input": {
-        "input_method": "win32",
+        "input_method": "dd",
         "fov": 600.0,
         "auto_lock": false,
         "mouse_sensitivity": 1.4,

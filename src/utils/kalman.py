@@ -34,6 +34,18 @@ class KalmanFilter:
         # 初始状态
         self.x = None
 
+    def predict(self):
+        """
+        仅进行预测步骤，不更新观测值。
+        用于目标丢失时的轨迹保持。
+        """
+        if self.x is None:
+            return None
+            
+        self.x = self.A @ self.x
+        self.P = self.A @ self.P @ self.A.T + self.Q
+        return self.x[:2]
+
     def update(self, z):
         """
         更新观测值 z = [x, y]

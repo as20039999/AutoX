@@ -113,15 +113,21 @@ class AutoXController:
         self.batch_size = 1 # 默认批次大小 (开启批处理时动态增加)
         self.max_batch_size = 4 # 最大允许批次大小
 
+        # [优化] 置信度滞后逻辑 (Confidence Hysteresis)
+        # 初始锁定需要较高的置信度，但一旦锁定，允许置信度稍微下降而不丢失目标
+        self.lock_conf_thres = self.config.get("inference.conf_thres", 0.4)
+        # 将推理引擎的基础置信度降低，以便我们在 controller 中进行更灵活的过滤
+        self.inference.conf_thres = max(0.1, self.lock_conf_thres - 0.1)
+        
         # 4. 鼠标运动监控 (防抖与用户优先策略)
         # 阈值 30px, 冷却 50ms (0.05s)
         self.mouse_monitor = MouseMonitor(threshold=30, timeout=0.05)
         
         # 进阶控制算法
         self.kf = KalmanFilter()
-        self.kalman_enabled = False     # 默认关闭，响应用户要求
-        self.ema_enabled = False        # 默认关闭，响应用户要求
-        self.ema_alpha = 0.7
+        self.kalman_enabled = True      # 开启卡尔曼滤波，减少预测跳动
+        self.ema_enabled = True         # 开启 EMA 平滑，减少高频抖动
+        self.ema_alpha = 0.5            # 调小 alpha，增加平滑度
         
         # 动态 PID 配置
         self.dynamic_pid_enabled = True # 开启动态 PID
@@ -404,6 +410,11 @@ class AutoXController:
                     # 尽可能清空队列，只取最后一帧，保证实时性（跳过积压帧）
                     # 阻塞获取第一帧，超时 100ms
                     item = self.frame_queue.get(timeout=0.1)
+                    
+                    # 检查停止信号，如果已停止则立即退出
+                    if self.stop_event.is_set():
+                        break
+                        
                     batch_items = [item]
                     
                     # 丢弃积压的旧帧，只留最后一帧
@@ -412,6 +423,10 @@ class AutoXController:
                             batch_items = [self.frame_queue.get_nowait()]
                         except queue.Empty:
                             break
+                    
+                    # 再次检查停止信号
+                    if self.stop_event.is_set():
+                        break
                     
                     # 记录开始推理的时间点
                     self.last_frame_time = time.perf_counter()
@@ -449,6 +464,9 @@ class AutoXController:
                         offset_x, offset_y = x1_crop, y1_crop
 
                     # 3. 执行推理 (始终单帧推理以保证最低延迟)
+                    if self.stop_event.is_set():
+                        break
+                        
                     results = self.inference.predict(inference_frame)
                     inf_batch = 1
                     
@@ -624,15 +642,16 @@ class AutoXController:
                                     sticky_box = None
 
                         # B. 寻找最佳新目标 (Best New Target)
-                        # 用户要求：锁定第一个识别到的，不用管得分。
-                        # 这样可以避免在两个目标间反复跳变
+                        # [优化] 新目标必须满足 lock_conf_thres 门槛
                         best_new_res = None
                         best_new_box = None
                         
-                        if candidates:
-                            # 直接取第一个，简单粗暴，防止挑选导致的跳变
-                            best_new_res = candidates[0][0]
-                            best_new_box = candidates[0][2]
+                        # 过滤出符合锁定门槛的新目标候选
+                        new_target_candidates = [c for c in candidates if c[0][4] >= self.lock_conf_thres]
+                        if new_target_candidates:
+                            # 取第一个符合门槛的作为新目标
+                            best_new_res = new_target_candidates[0][0]
+                            best_new_box = new_target_candidates[0][2]
 
                         # C. 最终决策
                         # 逻辑变更：引入目标切换防抖 (Switch Delay)
@@ -689,6 +708,7 @@ class AutoXController:
                     self.switch_delay_frames = 0
                     self.kf.reset()
                 
+                # B. 目标处理逻辑 (准与稳)
                 if target is not None:
                     # 统计捕获延迟 (Capture -> Target Locked)
                     cap_lock_latency_ms = (time.perf_counter() - current_frame_capture_time) * 1000
@@ -699,7 +719,7 @@ class AutoXController:
                     if self.use_fov_inference:
                         tx1, ty1, tx2, ty2 = tx1 + offset_x, ty1 + offset_y, tx2 + offset_x, ty2 + offset_y
                     
-                    # 使用卡尔曼滤波进行预测 (准)
+                    # 使用卡尔曼滤波进行更新 (准)
                     if self.kalman_enabled:
                         pos = self.kf.update([(tx1 + tx2) / 2, (ty1 + ty2) / 2])
                         if pos is not None:
@@ -716,7 +736,7 @@ class AutoXController:
                     target_height = ty2 - ty1
                     raw_target_y = ty1 + (target_height * self.aim_offset_y)
                     
-                    # 2. 引入指数平滑 (EMA)，进一步过滤高频抖动 (稳)
+                    # 引入指数平滑 (EMA)，进一步过滤高频抖动 (稳)
                     if self.ema_enabled:
                         if self.last_target_center is not None:
                             target_center_x = self.ema_alpha * raw_target_x + (1 - self.ema_alpha) * self.last_target_center[0]
@@ -733,11 +753,20 @@ class AutoXController:
                     self.target_lost_frames = 0
                 else:
                     self.target_lost_frames += 1
-                    # 稳：在短时间内保持上一帧位置 (用于平滑预测)
-                    if self.target_lost_frames > self.max_target_lost_frames:
+                    
+                    # [优化] 画面抽动解决：目标丢失时的轨迹保持逻辑
+                    # 如果丢失时间在允许范围内，使用卡尔曼滤波预测位置，避免鼠标立即停止导致的抽动
+                    if self.target_lost_frames <= self.max_target_lost_frames and self.kalman_enabled:
+                        pos = self.kf.predict()
+                        if pos is not None and self.last_target_center is not None:
+                            # 使用预测位置作为当前瞄准点
+                            target_center_x, target_center_y = pos[0], pos[1]
+                            # 保持 target 不为 None，以便进入后续控制逻辑
+                            target = [0, 0, 0, 0, 0, 0] 
+                        else:
+                            self.last_target_center = None
+                    else:
                         self.last_target_center = None
-                        # 注意：这里不清除 last_target_box，直到超过 lock_stick_frames 才清除
-                        # self.last_target_box = None 
                         self.locked_conf = 0.0
                         self.prev_raw_error_y = 0.0
                     
@@ -982,22 +1011,24 @@ class AutoXController:
         self.running = False
         self.stop_event.set()
         
-        # 1. 快速等待线程退出 (带更短的超时，避免 GUI 长时间挂起)
-        # 推理线程通常最重，给予 1.5s
+        # 唤醒可能阻塞在 wait 上的线程
+        self.move_event.set()
+        
+        # 给线程一点时间自行处理退出逻辑
+        time.sleep(0.05)
+        
+        # 1. 等待线程退出 (带超时)
+        # 优先等待最重的推理线程
         if hasattr(self, 't_inf') and self.t_inf.is_alive():
-            self.t_inf.join(timeout=1.5)
-            if self.t_inf.is_alive():
-                print("[Core] 警告: 推理线程未能在超时时间内正常退出")
-                
-        # 采集线程通常很快，给予 0.5s
-        if hasattr(self, 't_cap') and self.t_cap.is_alive():
-            self.t_cap.join(timeout=0.5)
+            self.t_inf.join(timeout=1.0)
             
-        # 输入线程给予 0.5s
+        # 采集线程通常很快
+        if hasattr(self, 't_cap') and self.t_cap.is_alive():
+            self.t_cap.join(timeout=0.3)
+            
+        # 输入线程
         if hasattr(self, 't_input') and self.t_input.is_alive():
-            self.t_input.join(timeout=0.5)
-            if self.t_input.is_alive():
-                print("[Core] 警告: 输入线程未能在超时时间内正常退出")
+            self.t_input.join(timeout=0.3)
 
         # 最终状态检查
         active_threads = []
@@ -1007,6 +1038,8 @@ class AutoXController:
         
         if active_threads:
             print(f"[Core] 警告: 以下线程仍处于活跃状态: {', '.join(active_threads)}，可能因驱动或 CUDA 阻塞。")
+        else:
+            print("[Core] 所有核心线程已安全停止。")
 
         # 2. 释放输入资源 (DD 驱动子进程)
         if hasattr(self.input, 'cleanup'):
