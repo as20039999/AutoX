@@ -80,7 +80,7 @@ class YOLOInference(AbstractInference):
         # 在禁用同步设置后，再应用安全补丁（补丁中包含 import ultralytics.nn.tasks，可能会触发初始化）
         apply_torch_safety_patch()
         
-        self.model = YOLO(self.model_path)
+        self.model = YOLO(self.model_path, task='detect')
         self.project_root = get_root_path()
         
         # 强制检查设备

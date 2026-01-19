@@ -341,7 +341,7 @@ class TrainingThread(QThread):
                 except Exception as e:
                     print(f"Update settings failed: {e}")
 
-                model = YOLO(self.model_path)
+                model = YOLO(self.model_path, task='detect')
                 
                 # 定义回调来检查停止标志
                 def on_train_batch_start(trainer):
@@ -520,7 +520,7 @@ class ExportTRTThread(QThread):
             self.log_signal.emit(f"参数: imgsz={self.imgsz}, half={self.half}")
             self.log_signal.emit("提示: TensorRT 导出可能需要 3-10 分钟，请耐心等待...")
             
-            model = YOLO(self.model_path)
+            model = YOLO(self.model_path, task='detect')
             # 执行导出
             export_path = model.export(
                 format='engine',

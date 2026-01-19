@@ -791,15 +791,23 @@ class AutoBackend(nn.Module):
             
             # Fix: Try async execution first using try-except to handle potential hasattr issues or version discrepancies
             try:
-                self.context.execute_async_v2(binding_addrs, stream_handle=stream)
+                # Try TensorRT 10+ async execution first if available
+                if self.is_trt10 and hasattr(self.context, "execute_async_v3"):
+                    for name, addr in self.binding_addrs.items():
+                        self.context.set_tensor_address(name, addr)
+                    self.context.execute_async_v3(stream_handle=stream)
+                else:
+                    self.context.execute_async_v2(binding_addrs, stream_handle=stream)
             except (AttributeError, TypeError):
                 try:
                     self.context.enqueue_v2(binding_addrs, stream_handle=stream)
                 except (AttributeError, TypeError):
                     # Fallback to sync execution (prone to freezing on Windows)
                     # Log warning if we are forced to use sync mode
-                    if not hasattr(self, '_warned_sync_mode'):
-                        print(f"[AutoBackend] Warning: Async inference not available. Context type: {type(self.context)}. Methods: {[m for m in dir(self.context) if 'execute' in m or 'enqueue' in m]}")
+                    if not hasattr(self, "_warned_sync_mode"):
+                        print(
+                            f"[AutoBackend] Warning: Async inference not available. Context type: {type(self.context)}. Methods: {[m for m in dir(self.context) if 'execute' in m or 'enqueue' in m]}"
+                        )
                         self._warned_sync_mode = True
                     self.context.execute_v2(binding_addrs)
                 
