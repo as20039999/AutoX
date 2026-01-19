@@ -180,15 +180,20 @@ class YOLOInference(AbstractInference):
             boxes = result.boxes
             frame_detections = []
             
-            if boxes is not None:
-                # 遍历所有检测到的目标
+            if boxes is not None and len(boxes.data) > 0:
+                # 优化：批量处理检测框，减少 Python 对象创建开销
                 # boxes.data 包含 (x1, y1, x2, y2, conf, cls)
-                for box in boxes.data:
-                    x1, y1, x2, y2, conf, cls = box.tolist()
-                    
-                    # 再次过滤 (双重保险)
-                    if conf >= self.conf_thres:
-                        # 坐标取整
+                data = boxes.data
+                
+                # 过滤置信度 (虽然 predict 已经过滤，但这里做一次 CPU 转换前的最后筛选)
+                mask = data[:, 4] >= self.conf_thres
+                filtered_data = data[mask]
+                
+                if len(filtered_data) > 0:
+                    # 一次性搬运到 CPU 并转为 numpy，比逐个 box.tolist() 快得多
+                    det_array = filtered_data.cpu().numpy()
+                    for i in range(det_array.shape[0]):
+                        x1, y1, x2, y2, conf, cls = det_array[i]
                         frame_detections.append((
                             int(x1), int(y1), int(x2), int(y2), 
                             float(conf), int(cls)

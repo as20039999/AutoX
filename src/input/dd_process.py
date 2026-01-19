@@ -64,139 +64,96 @@ def dd_worker_process(cmd_queue, status_queue, dll_path):
 
     # 命令循环
     last_action_time = 0.0
-    # 优化：最小间隔设为 3ms (约 333Hz)
-    # 既能保证视觉上的平滑，又能大幅减轻驱动子进程的轮询压力
-    min_action_interval = 0.003
+    # 严格遵守驱动要求：最小间隔 10ms (100Hz)
+    # 否则驱动可能 down
+    min_action_interval = 0.010
 
     while True:
         try:
             now = time.time()
             
-            # 1. 频率保护：如果刚执行完动作，强制休息
+            # 1. 计算当前距离“可以执行下一次操作”的时间
             time_since_last = now - last_action_time
-            if time_since_last < min_action_interval:
-                time.sleep(min_action_interval - time_since_last)
-                now = time.time()
+            time_to_wait_for_interval = max(0.0, min_action_interval - time_since_last)
 
-            # 2. 计算阻塞等待时间
-            timeout = None
+            # 2. 处理已到期的延迟事件 (例如按键抬起)
+            # 必须同时满足：事件时间已到 且 距离上次操作已过 10ms
+            if pending_events and pending_events[0][0] <= now:
+                if time_to_wait_for_interval > 0:
+                    # 虽然事件到期了，但为了保护驱动，仍需等待间隔
+                    time.sleep(time_to_wait_for_interval)
+                    now = time.time()
+                
+                event = heapq.heappop(pending_events)
+                _, event_type, *args = event
+                if event_type == "key":
+                    dd_dll.DD_key(*args)
+                elif event_type == "btn":
+                    dd_dll.DD_btn(*args)
+                
+                last_action_time = time.time()
+                continue # 执行完一个操作后，重新进入循环检查间隔
+
+            # 3. 计算下一次阻塞获取的超时时间
+            # 我们希望在以下任一情况发生时唤醒：
+            # a) 间隔保护到期 (time_to_wait_for_interval)
+            # b) 延迟事件到期 (pending_events[0][0] - now)
+            # c) 默认最大等待 (0.01s)
+            
+            wait_timeout = 0.01 
+            if time_to_wait_for_interval > 0:
+                wait_timeout = min(wait_timeout, time_to_wait_for_interval)
+            
             if pending_events:
-                # 如果有待处理事件，等待直到最近的一个事件到期
-                timeout = max(0.0, pending_events[0][0] - now)
-                # 优化：如果 timeout 极小，直接处理而不进入 get()，避免频繁唤醒
-                if timeout < 0.001:
-                    timeout = 0
+                event_wait = max(0.0, pending_events[0][0] - now)
+                wait_timeout = min(wait_timeout, event_wait)
             
-            # 3. 阻塞获取新命令
-            got_command = False
-            cmd_data = None
-            
+            # 如果 wait_timeout 太小（例如接近 0），强制给一个极小值避免死循环
+            wait_timeout = max(0.001, wait_timeout)
+
+            # 4. 阻塞获取新命令
             try:
-                # 仅当没有到期事件需要立即处理时，才进行带超时的阻塞
-                if timeout is None:
-                    cmd_data = cmd_queue.get()
-                    got_command = True
-                elif timeout > 0:
-                    cmd_data = cmd_queue.get(timeout=timeout)
-                    got_command = True
-                else:
-                    # timeout 为 0，说明有事件到期，非阻塞尝试获取新命令
-                    cmd_data = cmd_queue.get_nowait()
-                    got_command = True
+                cmd_data = cmd_queue.get(timeout=wait_timeout)
             except queue.Empty:
-                got_command = False
-            
-            # 4. 处理新命令
-            if got_command:
-                if cmd_data is None: # 退出信号
-                    break
+                continue
 
-                cmd = cmd_data[0]
-                args = cmd_data[1:]
-                
-                # 在执行任何新指令前，先清理队列中过期的移动指令 (仅保留最新的 move_rel)
-                # 这是一个优化策略：如果队列里积压了 10 个移动指令，我们只关心最新的那个
-                # 注意：不能清理 click 或 key 指令，否则会漏键
-                if cmd == 'move_rel':
-                    try:
-                        while True:
-                            # 尝试查看队列下一个是不是也是 move_rel
-                            # 注意：这里不能用 get_nowait 随意取，因为如果是 click 就得放回去，比较麻烦
-                            # 简单的策略是：只要我们处理得够快，这里不需要复杂的 peek 逻辑
-                            # 依靠主进程的 put_nowait 和队列长度限制即可
-                            break
-                    except:
-                        pass
-
-                if cmd == 'move_rel':
-                    dx, dy = args
-                    try:
-                        c_dx = ctypes.c_int(int(dx))
-                        c_dy = ctypes.c_int(int(dy))
-                        ret = dd_dll.DD_movR(c_dx, c_dy)
-                        last_action_time = time.time()
-                    except Exception as e:
-                        print(f"[DD-Process] move_rel error: {e}")
-                    
-                elif cmd == 'move_to':
-                    x, y = args
-                    dd_dll.DD_mov(int(x), int(y))
-                    last_action_time = time.time()
-                    
-                elif cmd == 'click':
-                    btn = args[0] # 1(L), 4(R), 16(M)
-                    
-                    # [修复] 频率保护：如果待处理的 btn_up 太多，说明之前点击还没结束
-                    # 为了防止 DD 驱动崩溃，我们在这里做一个简单的流控
-                    # 如果堆积超过 5 个未释放的按键，就丢弃本次点击 (50ms 的积压)
-                    if len(pending_events) > 5:
-                        continue
-                        
-                    # DD_btn 按下
-                    dd_dll.DD_btn(btn)
-                    last_action_time = time.time()
-                    
-                    # 计划抬起事件
-                    # 确保 delay 至少有一点点，比如 10ms-30ms
-                    delay = random.uniform(0.01, 0.03)
-                    release_time = time.time() + delay
-                    heapq.heappush(pending_events, (release_time, 'btn_up', btn * 2))
-                    
-                elif cmd == 'btn_down':
-                    btn = args[0]
-                    dd_dll.DD_btn(btn)
-                    last_action_time = time.time()
-                    
-                elif cmd == 'btn_up':
-                    btn = args[0]
-                    dd_dll.DD_btn(btn)
-                    last_action_time = time.time()
-                    
-                elif cmd == 'key_down':
-                    code = args[0]
-                    dd_dll.DD_key(code, 1)
-                    last_action_time = time.time()
-                    
-                elif cmd == 'key_up':
-                    code = args[0]
-                    dd_dll.DD_key(code, 2)
-                    last_action_time = time.time()
-                    
-                elif cmd == 'str':
-                    s = args[0]
-                    if isinstance(s, str):
-                        s = s.encode('ascii')
-                    dd_dll.DD_str(s)
-                    last_action_time = time.time()
-            
-            # 2. 处理到期的延迟事件
+            # 5. 准备执行命令，先检查并等待 10ms 间隔
             now = time.time()
-            while pending_events and pending_events[0][0] <= now:
-                _, evt_type, evt_arg = heapq.heappop(pending_events)
-                
-                if evt_type == 'btn_up':
-                    dd_dll.DD_btn(evt_arg)
-                    last_action_time = time.time()
+            time_to_wait_for_interval = max(0.0, min_action_interval - (now - last_action_time))
+            if time_to_wait_for_interval > 0:
+                time.sleep(time_to_wait_for_interval)
+            
+            # 6. 执行命令
+            cmd_type = cmd_data[0] if cmd_data is not None else "quit"
+            
+            if cmd_type == "move_rel":
+                dd_dll.DD_movR(cmd_data[1], cmd_data[2])
+            elif cmd_type == "move_to":
+                dd_dll.DD_mov(cmd_data[1], cmd_data[2])
+            elif cmd_type == "click":
+                btn = cmd_data[1]
+                dd_dll.DD_btn(btn)
+                # 延迟 10-30ms 后抬起
+                release_time = time.time() + random.uniform(0.01, 0.03)
+                heapq.heappush(pending_events, (release_time, "btn", btn * 2))
+            elif cmd_type == "btn_down":
+                dd_dll.DD_btn(cmd_data[1])
+            elif cmd_type == "btn_up":
+                dd_dll.DD_btn(cmd_data[1])
+            elif cmd_type == "key_down":
+                dd_dll.DD_key(cmd_data[1], 1)
+            elif cmd_type == "key_up":
+                dd_dll.DD_key(cmd_data[1], 2)
+            elif cmd_type == "str":
+                s = cmd_data[1]
+                if isinstance(s, str): s = s.encode('ascii')
+                dd_dll.DD_str(s)
+            elif cmd_type == "delay_event":
+                heapq.heappush(pending_events, cmd_data[1:])
+            elif cmd_type == "quit":
+                break
+            
+            last_action_time = time.time()
                     
         except Exception as e:
             if isinstance(e, EOFError): # 父进程关闭管道

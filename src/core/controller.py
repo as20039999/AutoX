@@ -176,6 +176,7 @@ class AutoXController:
         
         # 2. 按键动作 (队列式，保证不漏)
         self.action_queue = queue.Queue(maxsize=10)
+        self.move_event = threading.Event() # 用于唤醒输入线程
 
         # 系统状态监控 (每 10s 打印一次)
         self.last_report_time = time.perf_counter()
@@ -222,18 +223,14 @@ class AutoXController:
                     print(f"[Core] 采集异常: {e}")
                     time.sleep(0.01)
                 
-                # 优化：移除硬性 sleep，依靠 capture.get_frame() 的内部频率控制
-                # 或采用极短休眠避免空转 CPU
                 if self.target_fps > 0:
                     elapsed = time.perf_counter() - loop_start
-                    # 提高容忍度，只有当明显超过目标频率时才休眠
                     wait_time = (1.0 / self.target_fps) - elapsed
-                    if wait_time > 0.002: # 增加阈值，减少极短休眠
+                    if wait_time > 0.001:
                         time.sleep(wait_time)
-                    else:
-                        # 即使不休眠，也给系统调度一点机会
-                        # 0.001 (1ms) 是 Windows 下较好的平衡点
-                        time.sleep(0.001) 
+                    elif wait_time < -0.05:
+                        # 如果严重掉帧（超过 50ms），适当休眠以让出 CPU 给推理
+                        time.sleep(0.001)
 
         finally:
             self.capture.stop()
@@ -285,15 +282,21 @@ class AutoXController:
                 
                 # --- 2. 处理按键动作 (优先级次之) ---
                 try:
-                    # 非阻塞获取动作
-                    action_item = self.action_queue.get_nowait()
+                    # 闲时使用阻塞获取，显著降低 CPU 占用
+                    # 如果有移动指令，这里会通过 timeout 快速返回
+                    action_item = self.action_queue.get(timeout=0.005)
                     self._perform_action(action_item)
                 except queue.Empty:
                     pass
                 
-                # 短暂休眠，避免空转占用 CPU
-                # 调整休眠时间为 2ms，降低 CPU 负载同时保持足够响应速度 (500Hz)
-                time.sleep(0.002)
+                # 优化：智能等待机制
+                # 如果刚才处理了移动指令，则保持高频响应
+                if cmd:
+                     time.sleep(0.001) 
+                else:
+                     # 闲时：等待 move_event 信号或超时，避免空转
+                     self.move_event.wait(timeout=0.02)
+                     self.move_event.clear()
                     
             except Exception as e:
                 print(f"[Core] 输入线程异常: {e}")
@@ -873,6 +876,7 @@ class AutoXController:
                     if self.move_cmd_lock.acquire(blocking=False):
                         try:
                             self.latest_move_cmd = (time.perf_counter(), step_x, step_y)
+                            self.move_event.set() # 唤醒输入线程
                             # 关键：向监视器报告程序指令，以抵消余额，防止误判为用户移动
                             self.mouse_monitor.report_command(step_x, step_y)
                         finally:
