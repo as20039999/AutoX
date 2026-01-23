@@ -40,7 +40,7 @@ class AutoXController:
         self.device = device
         self.inference = YOLOInference(model_path=model_path, device=device)
         
-        input_method = self.config.get("input.input_method", "dd")
+        input_method = self.config.get("input.input_method", "syscall")
         print(f"[Core] Input Method: {input_method}")
         self.input = create_input(method=input_method)
         
@@ -259,14 +259,12 @@ class AutoXController:
         """输入控制线程：独立处理鼠标移动和按键，避免阻塞推理线程"""
         print(f"[Core] 输入线程已启动 (Thread: {threading.current_thread().name})")
         
-        # --- 关键修改：在输入线程内部初始化 DD 驱动 ---
-        # 确保 DD_btn(0) 和 DD_movR 在同一个线程执行，避免跨线程调用导致的死锁
+        # --- 关键修改：初始化输入驱动 (如果需要) ---
         try:
             if hasattr(self.input, 'init_driver'):
-                print("[Core] 正在输入线程中初始化 DD 驱动...")
                 self.input.init_driver()
         except Exception as e:
-            print(f"[Core] 🔴 DD 驱动线程内初始化失败: {e}")
+            print(f"[Core] 🔴 输入驱动初始化失败: {e}")
 
         last_move_time = 0.0
         # 优化：降低指令间隔限制。
@@ -1067,10 +1065,9 @@ class AutoXController:
         else:
             print("[Core] 所有核心线程已安全停止。")
 
-        # 2. 释放输入资源 (DD 驱动子进程)
+        # 2. 释放输入资源
         if hasattr(self.input, 'cleanup'):
             try:
-                # DDInput.cleanup 会调用 stop()，内部已有强制终止逻辑
                 self.input.cleanup()
             except Exception as e:
                 print(f"[Core] Input cleanup failed: {e}")

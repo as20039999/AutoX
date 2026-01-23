@@ -1,6 +1,6 @@
 {
     "inference": {
-        "model_path": "D:/Dev/Projects/AS/Yolo_train/cs/train6_3_result/weights/best.engine",
+        "model_path": "D:/Dev/Projects/AS/Yolo_train/cs/train6_3_result/weights/best.pt",
         "conf_thres": 0.66,
         "iou_thres": 0.45,
         "device": "cuda",

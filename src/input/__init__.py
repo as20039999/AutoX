@@ -1,21 +1,17 @@
 # from .win32_input import Win32Input
-# from .dd_input import DDInput
 
-def create_input(method="dd"):
+def create_input(method="syscall"):
     """
     输入模块工厂方法
     """
-    if method == "dd":
-        from .dd_input import DDInput
-        return DDInput()
-    elif method == "win32":
+    if method == "win32":
         from .win32_input import Win32Input
         return Win32Input()
     elif method == "syscall":
         from .syscall_input import SyscallInput
         return SyscallInput()
     
-    # 默认回退到 DD (或者可以改为报错)
-    print(f"[Input] 未知输入方法 '{method}'，默认使用 DD")
-    from .dd_input import DDInput
-    return DDInput()
+    # 默认回退到 syscall
+    print(f"[Input] 未知输入方法 '{method}'，默认使用 syscall")
+    from .syscall_input import SyscallInput
+    return SyscallInput()
