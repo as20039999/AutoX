@@ -1,6 +1,6 @@
 {
     "inference": {
-        "model_path": "D:/Dev/Projects/AS/Yolo_train/cs/train6_3_result/weights/TensorrtExecutionProvider_TRTKernel_graph_main_graph_4163725793028345964_0_0_fp16_sm120.engine",
+        "model_path": "D:/Dev/Projects/AS/Yolo_train/people_train_result_26_s_1/yolo26s.pt",
         "conf_thres": 0.66,
         "iou_thres": 0.45,
         "device": "cuda",

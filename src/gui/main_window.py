@@ -537,6 +537,85 @@ class ExportTRTThread(QThread):
             # 还原 stdout
             sys.stdout = old_stdout
 
+class AutoAnnotationThread(QThread):
+    progress = Signal(int)
+    finished = Signal(bool, str)
+
+    def __init__(self, model_path, data_dir, conf_thres, device='cuda'):
+        super().__init__()
+        self.model_path = model_path
+        self.data_dir = data_dir
+        self.conf_thres = conf_thres
+        self.device = device
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+
+    def run(self):
+        from ultralytics import YOLO
+        import cv2
+        from utils.yolo_helper import YOLOHelper
+        
+        try:
+            # 1. 加载模型
+            model = YOLO(self.model_path)
+            
+            # 2. 扫描图片
+            img_exts = ('.jpg', '.jpeg', '.png')
+            images = [f for f in os.listdir(self.data_dir) if f.lower().endswith(img_exts)]
+            total = len(images)
+            
+            if total == 0:
+                self.finished.emit(False, "目录中没有图片")
+                return
+
+            # 3. 遍历推理
+            count = 0
+            for img_name in images:
+                if not self.is_running:
+                    break
+                    
+                img_path = os.path.join(self.data_dir, img_name)
+                
+                # 推理
+                results = model.predict(
+                    source=img_path,
+                    conf=self.conf_thres,
+                    device=self.device,
+                    save=False,
+                    verbose=False
+                )
+                
+                # 解析结果
+                boxes_to_save = []
+                
+                for r in results:
+                    if r.boxes:
+                        # 获取原始图片尺寸
+                        h, w = r.orig_shape
+                        
+                        # r.boxes.data: (x1, y1, x2, y2, conf, cls)
+                        det_data = r.boxes.data.cpu().numpy()
+                        for row in det_data:
+                            x1, y1, x2, y2, conf, cls = row
+                            bw = x2 - x1
+                            bh = y2 - y1
+                            boxes_to_save.append([x1, y1, bw, bh, int(cls)])
+                        
+                        # 保存标签
+                        label_name = os.path.splitext(img_name)[0] + ".txt"
+                        label_path = os.path.join(self.data_dir, label_name)
+                        YOLOHelper.save_labels(label_path, boxes_to_save, w, h)
+                
+                count += 1
+                self.progress.emit(int(count / total * 100))
+            
+            self.finished.emit(True, f"自动标注完成！共处理 {count} 张图片。")
+            
+        except Exception as e:
+            self.finished.emit(False, f"自动标注失败: {str(e)}")
+
 class MainWindow(QMainWindow):
     def __init__(self, controller, config: ConfigManager):
         super().__init__()
@@ -550,10 +629,10 @@ class MainWindow(QMainWindow):
         
         # 设置窗口大小：默认高度 880，若超过屏幕可用高度则自适应
         screen_geo = self.screen().availableGeometry()
-        target_width = 800
+        target_width = 1200
         target_height = min(880, screen_geo.height())
         self.resize(target_width, target_height)
-        self.setMinimumWidth(target_width)
+        self.setMinimumWidth(800)
         
         self.setStyleSheet(MAIN_STYLE)
         
@@ -1566,6 +1645,14 @@ class MainWindow(QMainWindow):
         self.btn_organize.clicked.connect(self._label_organize_dataset)
         toolbar.addWidget(self.btn_organize)
 
+        toolbar.addSpacing(8)
+        self.btn_auto_label = QPushButton("自动标注")
+        self.btn_auto_label.setFixedWidth(80)
+        self.btn_auto_label.setFixedHeight(26)
+        self.btn_auto_label.setStyleSheet("font-size: 12px; padding: 0; margin: 0; background-color: #6a00ff;")
+        self.btn_auto_label.clicked.connect(self._label_auto_annotate)
+        toolbar.addWidget(self.btn_auto_label)
+
         toolbar.addSpacing(15)
         self.btn_toggle_draw = QPushButton("标注(W)")
         self.btn_toggle_draw.setCheckable(True)
@@ -1708,7 +1795,92 @@ class MainWindow(QMainWindow):
                 self.file_list.setCurrentRow(0)
                 item = self.file_list.item(0)
                 self.file_list.scrollToItem(item)
-                self._on_file_selected(item)
+            self._on_file_selected(item)
+
+    def _label_auto_annotate(self):
+        """使用现有模型自动标注当前目录"""
+        if not self.current_dir:
+            QMessageBox.warning(self, "提示", "请先打开数据集目录")
+            return
+            
+        # 1. 选择模型文件
+        model_path, _ = QFileDialog.getOpenFileName(
+            self, "选择用于自动标注的模型", "", "YOLO Models (*.pt)"
+        )
+        if not model_path:
+            return
+            
+        # 2. 确认
+        msg = "即将使用选定模型对当前目录下的所有图片进行自动标注。\n" \
+              "注意：这将覆盖已有的同名 .txt 标签文件！\n\n" \
+              "建议在执行前备份数据。\n" \
+              "是否继续？"
+        if QMessageBox.question(self, "确认自动标注", msg) != QMessageBox.Yes:
+            return
+            
+        # 3. 启动线程
+        self.btn_auto_label.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        
+        # 使用当前配置的置信度，或者默认 0.5
+        conf = self.config.get("inference.conf_thres", 0.5)
+        
+        self.auto_label_thread = AutoAnnotationThread(model_path, self.current_dir, conf)
+        self.auto_label_thread.progress.connect(self.progress_bar.setValue)
+        self.auto_label_thread.finished.connect(self._on_auto_annotation_finished)
+        self.auto_label_thread.start()
+
+    def _on_auto_annotation_finished(self, success, message):
+        self.btn_auto_label.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        
+        if success:
+            QMessageBox.information(self, "完成", message)
+            # 刷新当前显示的图片（如果有）
+            if self.file_list.currentItem():
+                self._on_file_selected(self.file_list.currentItem())
+        else:
+            QMessageBox.critical(self, "错误", message)
+
+    def _label_auto_annotate(self):
+        if not self.current_dir:
+            QMessageBox.warning(self, "提示", "请先打开数据集目录")
+            return
+            
+        # 选择模型
+        model_path, _ = QFileDialog.getOpenFileName(self, "选择用于自动标注的模型", "", "YOLO Models (*.pt)")
+        if not model_path:
+            return
+            
+        # 确认
+        msg = "即将使用选定模型对当前目录下的所有图片进行自动标注。\n注意：这将覆盖已有的同名 .txt 标签文件！\n建议在执行前备份数据。\n\n是否继续？"
+        if QMessageBox.question(self, "确认自动标注", msg) != QMessageBox.Yes:
+            return
+            
+        # 禁用按钮防止重复点击
+        self.btn_auto_label.setEnabled(False)
+        self.label_info.setText("正在自动标注中...")
+        
+        # 启动线程
+        conf = self.config.get("inference.conf_thres", 0.5)
+        self.auto_label_thread = AutoAnnotationThread(model_path, self.current_dir, conf)
+        self.auto_label_thread.progress.connect(lambda p: self.label_info.setText(f"正在自动标注: {p}%"))
+        self.auto_label_thread.finished.connect(self._on_auto_annotation_finished)
+        self.auto_label_thread.start()
+
+    def _on_auto_annotation_finished(self, success, message):
+        self.btn_auto_label.setEnabled(True)
+        if success:
+            QMessageBox.information(self, "完成", message)
+            self.label_info.setText("自动标注完成")
+            # 刷新当前图片的标签
+            if self.current_img_path:
+                # 模拟重新选中当前文件以重载标签
+                self._on_file_selected(self.file_list.currentItem())
+        else:
+            QMessageBox.critical(self, "错误", message)
+            self.label_info.setText("自动标注失败")
 
     def _label_organize_dataset(self):
         """将标注好的数据整理为训练数据集（images/labels 结构）"""
