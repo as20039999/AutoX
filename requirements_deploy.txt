@@ -1,0 +1,29 @@
+# AutoX 部署依赖环境 (用户自理)
+# 请运行 init_env.bat 自动安装这些依赖
+
+# 本地 Ultralytics 依赖包 (作为本地项目依赖)
+-e ./third_party/ultralytics
+
+PySide6==6.6.1
+
+# 深度学习后端 (对齐用户已知稳定版本)
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.1+cu128
+torchvision==0.24.1+cu128
+
+# 图像处理与采集
+numpy==1.26.4
+pywin32==306
+mss==9.0.1
+dxcam
+pyautogui
+
+# 模型优化 (TensorRT)
+wheel
+cuda-python 
+onnx>=1.12.0 
+onnxslim 
+onnxruntime-gpu 
+tensorrt-cu12>=10.0
+tensorrt-cu12-bindings>=10.0
+tensorrt-cu12-libs>=10.0

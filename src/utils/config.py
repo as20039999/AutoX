@@ -17,7 +17,7 @@ class ConfigManager:
             "max_fps": 60
         },
         "input": {
-            "input_method": "dd", # dd or win32
+            "input_method": "syscall", # syscall or win32
             "fov": 500,
             "auto_lock": True,
             "mouse_sensitivity": 1.0,
