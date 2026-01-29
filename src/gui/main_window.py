@@ -249,6 +249,8 @@ class TrainingThread(QThread):
             import logging
             import re
             import shutil
+            import torch
+            import traceback
             
             # 预先处理字体问题，避免训练时自动下载
             try:
@@ -362,6 +364,10 @@ class TrainingThread(QThread):
                 if not run_name:
                     run_name = "train_output"
                 
+                # 显式检测设备
+                device = '0' if torch.cuda.is_available() else 'cpu'
+                self.progress.emit(f"检测到训练设备: {device}")
+
                 model.train(
                     data=self.data_yaml,
                     epochs=self.epochs,
@@ -373,7 +379,8 @@ class TrainingThread(QThread):
                     name=run_name,
                     exist_ok=True,
                     patience=20, # 连续 20 轮无优化则停止
-                    verbose=False # 关闭详细日志输出，仅显示每轮摘要
+                    verbose=False, # 关闭详细日志输出，仅显示每轮摘要
+                    device=device
                 )
             finally:
                 # 无论成功失败，都移除处理器
@@ -385,6 +392,11 @@ class TrainingThread(QThread):
             else:
                 self.finished.emit(False, "训练已手动停止。")
         except Exception as e:
+            # 打印详细堆栈
+            tb = traceback.format_exc()
+            print(f"Training Error Traceback:\n{tb}")
+            self.progress.emit(f"\n[错误详情] 堆栈信息:\n{tb}")
+            
             if "Training stopped by user" in str(e):
                 self.finished.emit(False, "训练已手动停止。")
             else:
@@ -486,6 +498,52 @@ class OptimizationThread(QThread):
                 self.finished.emit(False, "优化未完成，可能未找到有效标注数据。")
         except Exception as e:
             self.finished.emit(False, f"优化过程中发生错误: {e}")
+
+class ExportONNXThread(QThread):
+    progress = Signal(int)
+    log_signal = Signal(str)
+    finished = Signal(bool, str)
+
+    def __init__(self, model_path, imgsz):
+        super().__init__()
+        self.model_path = model_path
+        self.imgsz = imgsz
+
+    def run(self):
+        from ultralytics import YOLO
+        import sys
+        import io
+
+        class StreamToSignal(io.TextIOBase):
+            def __init__(self, signal):
+                self.signal = signal
+            def write(self, s):
+                if s.strip():
+                    self.signal.emit(s.strip())
+                return len(s)
+
+        # 保存原始 stdout
+        old_stdout = sys.stdout
+        sys.stdout = StreamToSignal(self.log_signal)
+
+        try:
+            self.log_signal.emit(f"开始导出 ONNX 模型: {os.path.basename(self.model_path)}")
+            self.log_signal.emit(f"参数: imgsz={self.imgsz}")
+            
+            model = YOLO(self.model_path, task='detect')
+            # 执行导出
+            export_path = model.export(
+                format='onnx',
+                imgsz=self.imgsz,
+                simplify=True
+            )
+            
+            self.finished.emit(True, f"导出成功！模型已保存至:\n{export_path}")
+        except Exception as e:
+            self.finished.emit(False, f"导出失败: {str(e)}")
+        finally:
+            # 还原 stdout
+            sys.stdout = old_stdout
 
 class ExportTRTThread(QThread):
     progress = Signal(int)
@@ -2341,6 +2399,11 @@ class MainWindow(QMainWindow):
         opt_params.addWidget(self.opt_half_check)
         
         opt_params.addStretch()
+
+        self.btn_export_onnx = QPushButton("导出为 ONNX")
+        self.btn_export_onnx.setFixedHeight(32)
+        self.btn_export_onnx.clicked.connect(self._start_export_onnx)
+        opt_params.addWidget(self.btn_export_onnx)
         
         self.btn_export_trt = QPushButton("导出为 TensorRT 模型")
         self.btn_export_trt.setFixedHeight(32)
@@ -2558,11 +2621,23 @@ class MainWindow(QMainWindow):
             return
             
         is_engine = model_path.endswith(".engine")
-        self.btn_export_trt.setEnabled(not is_engine)
+        is_pt = model_path.endswith(".pt")
+        
+        # 只有 .pt 模型可以进行导出操作
+        self.btn_export_trt.setEnabled(is_pt)
         if is_engine:
             self.btn_export_trt.setToolTip("当前已是 TensorRT 模型，无需优化")
+        elif not is_pt:
+            self.btn_export_trt.setToolTip("仅支持从 .pt 模型导出")
         else:
             self.btn_export_trt.setToolTip("将当前模型转换为 TensorRT 格式以提升 FPS")
+            
+        if hasattr(self, 'btn_export_onnx'):
+            self.btn_export_onnx.setEnabled(is_pt)
+            if not is_pt:
+                self.btn_export_onnx.setToolTip("仅支持从 .pt 模型导出")
+            else:
+                self.btn_export_onnx.setToolTip("导出为 ONNX 通用格式")
 
     def _on_model_selection_changed(self, model_name):
         if not model_name: return
@@ -2614,6 +2689,42 @@ class MainWindow(QMainWindow):
             # 切换到该项 (会触发 _on_model_selection_changed)
             self.model_combo.setCurrentIndex(idx)
 
+    def _start_export_onnx(self):
+        """开始 ONNX 导出"""
+        model_path = self.config.get("inference.model_path", "base.pt")
+        if not os.path.isabs(model_path):
+            model_path = get_abs_path(model_path)
+            
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "错误", f"找不到模型文件: {model_path}")
+            return
+            
+        # 确认对话框
+        reply = QMessageBox.question(self, "导出确认", 
+                                     f"确定要将 {os.path.basename(model_path)} 转换为 ONNX 格式吗？\n\n"
+                                     "注意：\n"
+                                     "1. 导出过程可能需要几分钟。\n"
+                                     "2. 转换完成后将生成同名的 .onnx 文件。",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        
+        if reply != QMessageBox.Yes:
+            return
+
+        # 界面状态更新
+        self.btn_export_trt.setEnabled(False)
+        self.btn_export_onnx.setEnabled(False)
+        self.opt_progress.setVisible(True)
+        self.opt_progress.setRange(0, 0) # 忙碌状态
+        self.train_log.appendPlainText(f"\n[{time.strftime('%H:%M:%S')}] --- 开始 ONNX 转换任务 ---")
+
+        # 启动线程
+        imgsz = int(self.opt_imgsz_combo.currentText())
+        
+        self.export_onnx_thread = ExportONNXThread(model_path, imgsz)
+        self.export_onnx_thread.log_signal.connect(self._on_export_log)
+        self.export_onnx_thread.finished.connect(self._on_export_finished)
+        self.export_onnx_thread.start()
+
     def _start_export(self):
         """开始 TensorRT 导出"""
         model_path = self.config.get("inference.model_path", "base.pt")
@@ -2642,6 +2753,8 @@ class MainWindow(QMainWindow):
 
         # 界面状态更新
         self.btn_export_trt.setEnabled(False)
+        if hasattr(self, 'btn_export_onnx'):
+            self.btn_export_onnx.setEnabled(False)
         self.opt_progress.setVisible(True)
         self.opt_progress.setRange(0, 0) # 忙碌状态
         self.train_log.appendPlainText(f"\n[{time.strftime('%H:%M:%S')}] --- 开始 TensorRT 转换任务 ---")
@@ -2664,6 +2777,9 @@ class MainWindow(QMainWindow):
     def _on_export_finished(self, success, message):
         """导出完成处理"""
         self.btn_export_trt.setEnabled(True)
+        if hasattr(self, 'btn_export_onnx'):
+            self.btn_export_onnx.setEnabled(True)
+        
         self.opt_progress.setVisible(False)
         self.opt_progress.setRange(0, 100)
         

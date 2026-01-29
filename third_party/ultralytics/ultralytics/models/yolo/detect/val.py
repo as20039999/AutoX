@@ -284,6 +284,15 @@ class DetectionValidator(BaseValidator):
         """
         if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
             return {"tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)}
+            
+        # Ensure all tensors are on the same device (using preds as reference)
+        # This fixes "Expected all tensors to be on the same device" error during validation
+        target_device = preds["bboxes"].device
+        if batch["bboxes"].device != target_device:
+            batch["bboxes"] = batch["bboxes"].to(target_device)
+        if batch["cls"].device != target_device:
+            batch["cls"] = batch["cls"].to(target_device)
+            
         iou = box_iou(batch["bboxes"], preds["bboxes"])
         return {"tp": self.match_predictions(preds["cls"], batch["cls"], iou).cpu().numpy()}
 
