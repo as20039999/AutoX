@@ -15,7 +15,6 @@ from PySide6.QtWidgets import QApplication
 # 确保 src 目录在路径中
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from security.license import LicenseManager
 from utils.config import ConfigManager
 from gui.main_window import MainWindow
 
@@ -31,11 +30,11 @@ class AutoXApp:
         print("        AutoX - AI 自动化控制系统        ")
         print("========================================")
         
-        # 1. 安全授权检查
-        print("[Main] 正在进行安全环境检查...")
-        if not LicenseManager.verify_local_license():
-            print("\n[!] 错误: 未检测到有效授权，请先运行验证脚本生成测试 Key。")
-            return
+        # 1. 安全授权检查 (已移除)
+        # print("[Main] 正在进行安全环境检查...")
+        # if not LicenseManager.verify_local_license():
+        #     print("\n[!] 错误: 未检测到有效授权，请先运行验证脚本生成测试 Key。")
+        #     return
 
         # 2. 初始化核心控制器
         try:
