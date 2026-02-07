@@ -1,26 +1,26 @@
 {
     "inference": {
-        "model_path": "D:/Dev/Projects/AS/Yolo_train/people_train_result_26_s_3/weights/best.pt",
+        "model_path": "yolo26n.pt",
         "conf_thres": 0.66,
         "iou_thres": 0.45,
         "device": "cuda",
         "target_classes": [
             0
         ],
-        "max_fps": 35,
+        "max_fps": 30,
         "use_fov_inference": true,
         "fov_center_mode": "screen"
     },
     "input": {
         "input_method": "syscall",
-        "fov": 600.0,
+        "fov": 800.0,
         "auto_lock": false,
         "mouse_sensitivity": 1.4,
         "move_key": "Alt",
         "post_action": "",
         "post_action_count": 1,
         "post_action_interval_ms": 50,
-        "move_speed": "slow",
+        "move_speed": "custom",
         "custom_speed_ms": 10,
         "custom_speed_random": 50,
         "human_curve": false,

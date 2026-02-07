@@ -13,6 +13,26 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QIcon, QAction, QKeySequence, QShortcut, QPixmap, QPainter, QColor, QImage
 
+class NoScrollComboBox(QComboBox):
+    """
+    自定义 QComboBox，禁用未展开时的滚轮事件。
+    防止用户在滚动页面时不小心误触修改了设置。
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 允许鼠标点击获得焦点，但默认不通过滚轮获取焦点
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, event):
+        # 只有当下拉框弹出时，才允许滚轮事件
+        # 或者可以改成：只有当控件获得焦点时才允许 (不过用户说"不点开...不合理"，通常指弹出列表)
+        # 比较通用的做法是：如果 popup 未显示，则忽略滚轮事件
+        # 但为了保留标准行为（在列表展开时可以滚动），我们需要判断 view 是否可见
+        if self.view().isVisible():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
 class PreviewWindow(QDialog):
     """
     高性能实时预览窗口，使用 PySide6 实现以替代 cv2.imshow。
@@ -697,9 +717,6 @@ class MainWindow(QMainWindow):
         self._init_ui()
         self._load_config_to_ui()
         
-        # 排除在采集之外
-        self._exclude_from_capture(self)
-        
         # 状态更新定时器
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self._update_status)
@@ -854,7 +871,7 @@ class MainWindow(QMainWindow):
         infer_layout.addLayout(create_row("最高 FPS", self.max_fps_spin, "设置推理频率上限。最高 60 FPS，较高的 FPS 能提供更鲜活的图像，较低的 FPS 可以降低 CPU/GPU 负载。"))
 
         # 推理中心
-        self.fov_center_combo = QComboBox()
+        self.fov_center_combo = NoScrollComboBox()
         self.fov_center_combo.addItems(["屏幕中心", "鼠标位置"])
         self.fov_center_combo.currentIndexChanged.connect(self._on_config_changed)
         infer_layout.addLayout(create_row("推理中心", self.fov_center_combo, "选择推理区域和锁定范围的参考点。'屏幕中心'适合大多数第一人称射击游戏，'鼠标位置'适合 MOBA 或其他需要鼠标精准控制的游戏。"))
@@ -892,7 +909,7 @@ class MainWindow(QMainWindow):
         input_layout.setContentsMargins(12, 20, 12, 12)
 
         # 输入驱动选择
-        self.input_method_combo = QComboBox()
+        self.input_method_combo = NoScrollComboBox()
         self.input_method_combo.addItems(["Syscall Input (推荐)", "Win32 Input (兼容)"])
         self.input_method_combo.currentIndexChanged.connect(self._on_input_method_changed)
         input_layout.addLayout(create_row("输入驱动", self.input_method_combo, "选择输入驱动类型。切换后需要重启程序生效。"))
@@ -956,7 +973,7 @@ class MainWindow(QMainWindow):
         speed_label = QLabel("移动速度 (?)")
         speed_label.setToolTip("设置鼠标移动到目标的速度。'极快'为瞬移，其他模式会平滑过渡。")
         speed_label.setFixedWidth(80)
-        self.move_speed_combo = QComboBox()
+        self.move_speed_combo = NoScrollComboBox()
         self.move_speed_combo.addItems(["极快", "快速", "正常", "慢速", "自定义(ms)"])
         self.move_speed_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.move_speed_combo.setToolTip("设置鼠标移动到目标的速度。'极快'为瞬移，其他模式会平滑过渡。")
@@ -1097,7 +1114,7 @@ class MainWindow(QMainWindow):
         
         mode_layout = QHBoxLayout()
         mode_layout.addWidget(QLabel("模式:"))
-        self.extract_mode_combo = QComboBox()
+        self.extract_mode_combo = NoScrollComboBox()
         self.extract_mode_combo.addItems(["按总张数抽取", "按时间间隔抽取"])
         mode_layout.addWidget(self.extract_mode_combo)
         settings_layout.addLayout(mode_layout)
@@ -1128,7 +1145,7 @@ class MainWindow(QMainWindow):
         opt_label.setToolTip(opt_tooltip)
         opt_input_layout.addWidget(opt_label)
         
-        self.opt_imgsz_combo = QComboBox()
+        self.opt_imgsz_combo = NoScrollComboBox()
         self.opt_imgsz_combo.addItems(["640", "960", "1280"])
         self.opt_imgsz_combo.setCurrentText("640")
         self.opt_imgsz_combo.setToolTip(opt_tooltip)
@@ -1584,7 +1601,6 @@ class MainWindow(QMainWindow):
                 if self.preview_window is None:
                     self.preview_window = PreviewWindow(self)
                     self.preview_window.show()
-                    self._exclude_from_capture(self.preview_window)
             else:
                 if self.preview_window is not None:
                     self.preview_window.close()
@@ -1595,7 +1611,6 @@ class MainWindow(QMainWindow):
                 if self.overlay_window is None:
                     self.overlay_window = OverlayWindow()
                     self.overlay_window.show()
-                    self._exclude_from_capture(self.overlay_window)
             else:
                 if self.overlay_window is not None:
                     self.overlay_window.close()
@@ -1648,16 +1663,6 @@ class MainWindow(QMainWindow):
             if self.overlay_window is not None:
                 self.overlay_window.close()
                 self.overlay_window = None
-
-    def _exclude_from_capture(self, window):
-        """设置窗口不被截屏软件捕捉"""
-        try:
-            hwnd = window.winId()
-            # WDA_EXCLUDEFROMCAPTURE = 0x00000011 (Win10 2004+)
-            if not ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011):
-                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000001)
-        except Exception as e:
-            print(f"Exclude from capture failed: {e}")
 
     def _init_label_tab(self):
         main_layout = QHBoxLayout(self.label_tab)
@@ -2363,7 +2368,7 @@ class MainWindow(QMainWindow):
         
         sel_layout = QHBoxLayout()
         sel_layout.addWidget(QLabel("当前模型:"))
-        self.model_combo = QComboBox()
+        self.model_combo = NoScrollComboBox()
         self._refresh_model_list()
         self.model_combo.currentTextChanged.connect(self._on_model_selection_changed)
         sel_layout.addWidget(self.model_combo, 1)
@@ -2385,7 +2390,7 @@ class MainWindow(QMainWindow):
         
         opt_params = QHBoxLayout()
         opt_params.addWidget(QLabel("导出尺寸 (imgsz):"))
-        self.opt_imgsz_combo = QComboBox()
+        self.opt_imgsz_combo = NoScrollComboBox()
         self.opt_imgsz_combo.addItems(["320", "640", "960", "1280"])
         self.opt_imgsz_combo.setCurrentText("640")
         self.opt_imgsz_combo.setToolTip("建议与推理时的 FOV 匹配。640 是通用选择。")
@@ -2496,7 +2501,7 @@ class MainWindow(QMainWindow):
         
         # imgsz
         row2.addWidget(QLabel("训练分辨率 (imgsz) (?)"))
-        self.imgsz_combo = QComboBox()
+        self.imgsz_combo = NoScrollComboBox()
         self.imgsz_combo.addItems(["320", "640", "960", "1280", "1600", "1920"])
         self.imgsz_combo.setCurrentText("640")
         self.imgsz_combo.setToolTip("训练时图片缩放的大小。值越大精度越高，但训练越慢且越占显存。通常 640 是平衡点。")

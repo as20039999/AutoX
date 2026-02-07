@@ -1,10 +1,12 @@
 import threading
 import time
 import queue
-# import cv2 # 移除 opencv 依赖，防止被检测
+import cv2
 import torch
 import math
 import random
+import datetime
+import os
 import pyautogui
 import ctypes
 import psutil
@@ -205,7 +207,7 @@ class AutoXController:
         self.lock_count = 0
         self.total_capture_to_lock_latency = 0.0
         self.capture_to_lock_count = 0
-
+        
     def _check_trigger(self):
         """检查当前是否满足触发条件"""
         # 移除长按模式，默认始终为 True (只要运行中就执行推理逻辑)
@@ -431,6 +433,7 @@ class AutoXController:
                     
                     # 检查停止信号，如果已停止则立即退出
                     if self.stop_event.is_set():
+                        print("[Core] Inference loop detected stop event (pre-process), exiting...", flush=True)
                         break
                         
                     batch_items = [item]
@@ -454,6 +457,7 @@ class AutoXController:
                         continue
                     h, w = frame.shape[:2]
                     
+                    
                     if self.fov_center_mode == "mouse":
                         pt = POINT()
                         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
@@ -476,6 +480,7 @@ class AutoXController:
 
                     # 3. 执行推理 (始终单帧推理以保证最低延迟)
                     if self.stop_event.is_set():
+                        print("[Core] Inference loop detected stop event (pre-predict), exiting...", flush=True)
                         break
                         
                     results = self.inference.predict(inference_frame)
@@ -1044,15 +1049,15 @@ class AutoXController:
         # 1. 等待线程退出 (带超时)
         # 优先等待最重的推理线程
         if hasattr(self, 't_inf') and self.t_inf.is_alive():
-            self.t_inf.join(timeout=1.0)
+            self.t_inf.join(timeout=3.0)
             
         # 采集线程通常很快
         if hasattr(self, 't_cap') and self.t_cap.is_alive():
-            self.t_cap.join(timeout=0.3)
+            self.t_cap.join(timeout=1.0)
             
         # 输入线程
         if hasattr(self, 't_input') and self.t_input.is_alive():
-            self.t_input.join(timeout=0.3)
+            self.t_input.join(timeout=1.0)
 
         # 最终状态检查
         active_threads = []

@@ -8,7 +8,7 @@ def setup_runtime():
     """
     # 1. 获取当前程序运行目录
     if getattr(sys, 'frozen', False):
-        # 如果是 Nuitka 打包后的 EXE
+        # 如果是打包后的 EXE
         # base_dir 是 EXE 所在的物理目录
         base_dir = os.path.dirname(sys.executable)
         # bundle_dir 是资源文件被释放/映射的目录 (Nuitka 中通常就是 __file__ 所在目录)
@@ -38,11 +38,17 @@ def setup_runtime():
         if runtime_path not in sys.path:
             sys.path.insert(0, runtime_path)
     else:
-        # 如果找不到运行时环境，给出友好提示
-        import ctypes
-        message = "未检测到内置运行环境 (python_runtime)！\n\n请先运行 'init_env.bat' 初始化环境后再启动程序。"
-        ctypes.windll.user32.MessageBoxW(0, message, "启动错误", 0x10)
-        sys.exit(1)
+        # 2.1 降级处理：如果没有内置环境，检查是否在普通的 Python 虚拟环境或系统环境中运行
+        # 如果不是打包后的 EXE，且能导入业务模块，则允许继续
+        if not getattr(sys, 'frozen', False):
+            print("[Launcher] 未检测到内置运行环境，尝试使用当前 Python 环境启动...")
+            # 检查必要的模块是否可用，或者直接信任当前环境
+        else:
+            # 如果是打包后的 EXE 且缺失运行时，则必须报错
+            import ctypes
+            message = "未检测到内置运行环境 (python_runtime)！\n\n请先运行 'init_env.bat' 初始化环境后再启动程序。"
+            ctypes.windll.user32.MessageBoxW(0, message, "启动错误", 0x10)
+            sys.exit(1)
 
     # 3. 加载打包在 EXE 内部的内容 (业务逻辑 + 本地依赖包)
     # 将 src 目录加入路径

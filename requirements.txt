@@ -16,7 +16,6 @@ pyautogui
 
 # 安全防护预研
 pyarmor==8.4.6
-nuitka==2.0
 
 # 模型优化 (TensorRT - 待手动安装)
 wheel
