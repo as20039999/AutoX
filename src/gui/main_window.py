@@ -398,6 +398,7 @@ class TrainingThread(QThread):
                     project=project_path,
                     name=run_name,
                     exist_ok=True,
+                    amp=False, # 禁用 AMP 检测以避免在部分 Windows 环境下卡死
                     patience=20, # 连续 20 轮无优化则停止
                     verbose=False, # 关闭详细日志输出，仅显示每轮摘要
                     device=device
